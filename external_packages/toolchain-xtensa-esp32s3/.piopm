@@ -1,0 +1,1 @@
+{"type": "tool", "name": "toolchain-xtensa-esp32s3", "version": "8.4.0+2021r2-patch5", "spec": {"owner": "espressif", "id": 12550, "name": "toolchain-xtensa-esp32s3", "requirements": null, "uri": null}}
