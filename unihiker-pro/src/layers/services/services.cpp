@@ -119,6 +119,13 @@ static bool probeI2cAddress(TwoWire &wire, uint8_t addr) {
   wire.beginTransmission(addr);
   return wire.endTransmission() == 0;
 }
+
+static bool toSdFsPath(const String &rawPath, String *outPath) {
+  if (outPath == nullptr) return false;
+  if (!rawPath.startsWith("S:/")) return false;
+  *outPath = rawPath.substring(2);
+  return outPath->length() > 0;
+}
 }  // namespace
 
 InputService *InputService::activeTimedController_ = nullptr;
@@ -1222,31 +1229,208 @@ Status StorageService::savePhotoBmp(const String &path) {
   return Status::OkStatus();
 }
 
-Status AudioService::playBuiltIn(Melodies melody, MelodyOptions options) {
+Status AudioService::lockState() {
+  if (!stateMutex_) {
+    return Status::Error(StatusCode::IOError, "audio mutex unavailable");
+  }
+  if (xSemaphoreTake(stateMutex_, pdMS_TO_TICKS(300)) != pdTRUE) {
+    return Status::Error(StatusCode::Busy, "audio state busy");
+  }
+  return Status::OkStatus();
+}
+
+void AudioService::unlockState() {
+  if (stateMutex_) {
+    xSemaphoreGive(stateMutex_);
+  }
+}
+
+Status AudioService::ensureAudioReadyLocked() {
   if (!boardHal_.isReady()) {
     return Status::Error(StatusCode::NotInitialized, "board not initialized");
   }
+  if (!i2sReady_) {
+    boardHal_.board().initI2S();
+    i2sReady_ = true;
+  }
+  return Status::OkStatus();
+}
+
+Status AudioService::beginSessionLocked(SessionType type) {
+  if (activeSession_ != SessionType::None && activeSession_ != type) {
+    return Status::Error(StatusCode::Busy, "audio session busy");
+  }
+  activeSession_ = type;
+  return Status::OkStatus();
+}
+
+void AudioService::endSessionLocked(SessionType type) {
+  if (activeSession_ == type) {
+    activeSession_ = SessionType::None;
+  }
+}
+
+Status AudioService::playBuiltIn(Melodies melody, MelodyOptions options) {
+  Status st = lockState();
+  if (!st.ok()) return st;
+
+  st = ensureAudioReadyLocked();
+  if (!st.ok()) {
+    unlockState();
+    return st;
+  }
+
+  st = beginSessionLocked(SessionType::BuiltIn);
+  if (!st.ok()) {
+    unlockState();
+    return st;
+  }
+  unlockState();
+
   audioHal_.music().playMusic(melody, options);
+
+  if (options == Once || options == Forever) {
+    st = lockState();
+    if (!st.ok()) return st;
+    endSessionLocked(SessionType::BuiltIn);
+    unlockState();
+  }
+
   return Status::OkStatus();
 }
 
 Status AudioService::stopBuiltIn() {
+  Status st = lockState();
+  if (!st.ok()) return st;
+  if (!boardHal_.isReady()) {
+    unlockState();
+    return Status::Error(StatusCode::NotInitialized, "board not initialized");
+  }
+
   audioHal_.music().stopPlayTone();
+  endSessionLocked(SessionType::BuiltIn);
+  unlockState();
   return Status::OkStatus();
 }
 
 Status AudioService::playFile(const String &path) {
+  if (path.length() == 0) {
+    return Status::Error(StatusCode::InvalidArgument, "path is empty");
+  }
+  String sdPath;
+  if (!toSdFsPath(path, &sdPath)) {
+    return Status::Error(StatusCode::InvalidArgument, "path must start with S:/");
+  }
+
+  Status st = lockState();
+  if (!st.ok()) return st;
+
+  st = ensureAudioReadyLocked();
+  if (!st.ok()) {
+    unlockState();
+    return st;
+  }
+
+  if (activeSession_ == SessionType::File) {
+    audioHal_.music().stopPlayAudio();
+  }
+
+  st = beginSessionLocked(SessionType::File);
+  if (!st.ok()) {
+    unlockState();
+    return st;
+  }
+
+  st = ensureSdReadyNoLoop();
+  if (!st.ok()) {
+    endSessionLocked(SessionType::File);
+    unlockState();
+    return st;
+  }
+  if (!SD.exists(sdPath)) {
+    endSessionLocked(SessionType::File);
+    unlockState();
+    return Status::Error(StatusCode::IOError, "audio file not found");
+  }
+  unlockState();
+
   audioHal_.music().playTFCardAudio(path);
   return Status::OkStatus();
 }
 
 Status AudioService::stopFile() {
+  Status st = lockState();
+  if (!st.ok()) return st;
+  if (!boardHal_.isReady()) {
+    unlockState();
+    return Status::Error(StatusCode::NotInitialized, "board not initialized");
+  }
+
   audioHal_.music().stopPlayAudio();
+  endSessionLocked(SessionType::File);
+  unlockState();
   return Status::OkStatus();
 }
 
 Status AudioService::recordFile(const String &path, uint8_t seconds) {
+  if (path.length() == 0) {
+    return Status::Error(StatusCode::InvalidArgument, "path is empty");
+  }
+  String sdPath;
+  if (!toSdFsPath(path, &sdPath)) {
+    return Status::Error(StatusCode::InvalidArgument, "path must start with S:/");
+  }
+  if (seconds == 0) {
+    return Status::Error(StatusCode::InvalidArgument, "seconds must be > 0");
+  }
+
+  Status st = lockState();
+  if (!st.ok()) return st;
+
+  st = ensureAudioReadyLocked();
+  if (!st.ok()) {
+    unlockState();
+    return st;
+  }
+
+  st = beginSessionLocked(SessionType::Recording);
+  if (!st.ok()) {
+    unlockState();
+    return st;
+  }
+
+  st = ensureSdReadyNoLoop();
+  if (!st.ok()) {
+    endSessionLocked(SessionType::Recording);
+    unlockState();
+    return st;
+  }
+
+  // Remove stale file so failed writes cannot be mistaken as successful output.
+  if (SD.exists(sdPath)) {
+    (void)SD.remove(sdPath);
+  }
+  unlockState();
+
   audioHal_.music().recordSaveToTFCard(path, seconds);
+
+  st = lockState();
+  if (!st.ok()) return st;
+
+  bool fileOk = false;
+  File f = SD.open(sdPath, FILE_READ);
+  if (f) {
+    fileOk = f.size() > 44;
+    f.close();
+  }
+
+  endSessionLocked(SessionType::Recording);
+  unlockState();
+
+  if (!fileOk) {
+    return Status::Error(StatusCode::IOError, "record output not created");
+  }
+
   return Status::OkStatus();
 }
 

@@ -333,7 +333,11 @@ class StorageService {
 class AudioService {
  public:
   AudioService(IBoardHal &boardHal, IAudioHal &audioHal)
-      : boardHal_(boardHal), audioHal_(audioHal) {}
+      : boardHal_(boardHal),
+        audioHal_(audioHal),
+        stateMutex_(xSemaphoreCreateMutex()),
+        i2sReady_(false),
+        activeSession_(SessionType::None) {}
 
   Status playBuiltIn(Melodies melody, MelodyOptions options = OnceInBackground);
   Status stopBuiltIn();
@@ -342,8 +346,24 @@ class AudioService {
   Status recordFile(const String &path, uint8_t seconds);
 
  private:
+  enum class SessionType : uint8_t {
+    None = 0,
+    BuiltIn,
+    File,
+    Recording,
+  };
+
+  Status lockState();
+  void unlockState();
+  Status ensureAudioReadyLocked();
+  Status beginSessionLocked(SessionType type);
+  void endSessionLocked(SessionType type);
+
   IBoardHal &boardHal_;
   IAudioHal &audioHal_;
+  SemaphoreHandle_t stateMutex_;
+  bool i2sReady_;
+  SessionType activeSession_;
 };
 
 class VisionService {
