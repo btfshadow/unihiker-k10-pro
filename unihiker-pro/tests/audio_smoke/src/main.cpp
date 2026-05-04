@@ -15,7 +15,7 @@ static volatile bool gRecordSuccess = false;
 static volatile uint32_t gRecordBytes = 0;
 static uint32_t gRecordStartMs = 0;
 
-static const char kRecordApiPath[] = "S:/audio_test.wav";
+static String gRecordApiPath = "S:/audio/audio_test.wav";
 
 static void fillWavHeader(uint8_t *header, uint32_t dataSize,
                           uint32_t sampleRate = 16000,
@@ -94,7 +94,7 @@ static void recordTask(void *arg) {
   if (xSPIlMutex) {
     xSemaphoreTake(xSPIlMutex, portMAX_DELAY);
   }
-  ret = lv_fs_open(&file, kRecordApiPath, LV_FS_MODE_WR);
+  ret = lv_fs_open(&file, gRecordApiPath.c_str(), LV_FS_MODE_WR);
   if (xSPIlMutex) {
     xSemaphoreGive(xSPIlMutex);
   }
@@ -203,7 +203,7 @@ static void recordTask(void *arg) {
     if (xSPIlMutex) {
       xSemaphoreTake(xSPIlMutex, portMAX_DELAY);
     }
-    ret = lv_fs_open(&verify, kRecordApiPath, LV_FS_MODE_RD);
+    ret = lv_fs_open(&verify, gRecordApiPath.c_str(), LV_FS_MODE_RD);
     if (ret == LV_FS_RES_OK) {
       (void)lv_fs_seek(&verify, 0, LV_FS_SEEK_END);
       (void)lv_fs_tell(&verify, &verifySize);
@@ -268,7 +268,7 @@ static void onButtonA() {
     return;
   }
 
-  Status st = board.audio().playFile(kRecordApiPath);
+  Status st = board.audio().playFile(gRecordApiPath);
   USBSerial.printf("A -> replay: code=%d, msg=%s\n", (int)st.code, st.message);
   if (!st.ok()) {
     drawState("replay failed", st.message, 0xCC0000);
@@ -302,6 +302,15 @@ void setup() {
   boot.initAi = false;
 
   board.begin(boot);
+
+  // Defaults: BMP -> S:/images, WAV -> S:/audio.
+  // User may override with setAudioDirectory("S:/my_audio_folder").
+  (void)board.storage().setAudioDirectory("S:/audio");
+  Status storageSt = board.storage().ensureDirectories();
+  if (!storageSt.ok()) {
+    USBSerial.printf("storage dirs init failed: %s\n", storageSt.message);
+  }
+  gRecordApiPath = board.storage().audioPath("audio_test.wav");
   board.led().setBrightness(3);
   board.led().off();
   board.pins().write(BoardPin::LcdBacklight, true);
@@ -338,7 +347,7 @@ void loop() {
     } else {
       drawState("record ok", "replaying...", 0x006600);
       board.led().setRgb(0, {0, 160, 0});
-      Status st = board.audio().playFile(kRecordApiPath);
+      Status st = board.audio().playFile(gRecordApiPath);
       USBSerial.printf("auto replay: code=%d, msg=%s\n", (int)st.code, st.message);
       if (!st.ok()) {
         drawState("recorded, replay fail", st.message, 0xCC0000);

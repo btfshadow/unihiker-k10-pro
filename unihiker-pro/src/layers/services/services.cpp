@@ -1229,6 +1229,133 @@ Status StorageService::savePhotoBmp(const String &path) {
   return Status::OkStatus();
 }
 
+String StorageService::normalizeDirectory(const String &dir) const {
+  String out = dir;
+  out.trim();
+  if (out.length() == 0) {
+    return "S:/";
+  }
+
+  if (out.startsWith("S:/")) {
+    // already normalized
+  } else if (out.startsWith("S:")) {
+    out = "S:/" + out.substring(2);
+  } else if (out.startsWith("/")) {
+    out = "S:" + out;
+  } else {
+    out = "S:/" + out;
+  }
+
+  while (out.length() > 3 && out.endsWith("/")) {
+    out.remove(out.length() - 1);
+  }
+  return out;
+}
+
+String StorageService::normalizeFileName(const String &fileName) const {
+  String out = fileName;
+  out.trim();
+
+  if (out.startsWith("S:/")) {
+    int slash = out.lastIndexOf('/');
+    out = (slash >= 0) ? out.substring(slash + 1) : out;
+  } else if (out.startsWith("/")) {
+    int slash = out.lastIndexOf('/');
+    out = (slash >= 0) ? out.substring(slash + 1) : out;
+  }
+
+  if (out.length() == 0) {
+    out = "unnamed.bin";
+  }
+  return out;
+}
+
+String StorageService::joinPath(const String &dir, const String &fileName) const {
+  if (fileName.startsWith("S:/")) {
+    return fileName;
+  }
+
+  String folder = normalizeDirectory(dir);
+  String name = normalizeFileName(fileName);
+  if (folder.endsWith("/")) {
+    return folder + name;
+  }
+  return folder + "/" + name;
+}
+
+Status StorageService::ensureDirectoryExists(const String &dir) const {
+  if (!hal_.isReady()) {
+    return Status::Error(StatusCode::NotInitialized, "board not initialized");
+  }
+  Status sdStatus = ensureSdReadyNoLoop();
+  if (!sdStatus.ok()) return sdStatus;
+
+  String apiDir = normalizeDirectory(dir);
+  String sdDir;
+  if (!toSdFsPath(apiDir, &sdDir)) {
+    return Status::Error(StatusCode::InvalidArgument, "invalid storage directory");
+  }
+  if (!sdDir.startsWith("/")) {
+    sdDir = "/" + sdDir;
+  }
+  if (sdDir == "/") {
+    return Status::OkStatus();
+  }
+
+  String partial;
+  int start = 1;
+  while (start < sdDir.length()) {
+    int slash = sdDir.indexOf('/', start);
+    String segment = (slash < 0) ? sdDir.substring(start) : sdDir.substring(start, slash);
+
+    if (segment.length() > 0) {
+      partial += "/" + segment;
+      if (!SD.exists(partial)) {
+        if (!SD.mkdir(partial)) {
+          return Status::Error(StatusCode::IOError, "failed to create storage directory");
+        }
+      }
+    }
+
+    if (slash < 0) break;
+    start = slash + 1;
+  }
+
+  return Status::OkStatus();
+}
+
+Status StorageService::setImageDirectory(const String &dir) {
+  imageDir_ = normalizeDirectory(dir);
+  return Status::OkStatus();
+}
+
+Status StorageService::setAudioDirectory(const String &dir) {
+  audioDir_ = normalizeDirectory(dir);
+  return Status::OkStatus();
+}
+
+String StorageService::imageDirectory() const { return imageDir_; }
+
+String StorageService::audioDirectory() const { return audioDir_; }
+
+String StorageService::imagePath(const String &fileName,
+                                 const String &dirOverride) const {
+  const String &dir = (dirOverride.length() > 0) ? dirOverride : imageDir_;
+  return joinPath(dir, fileName);
+}
+
+String StorageService::audioPath(const String &fileName,
+                                 const String &dirOverride) const {
+  const String &dir = (dirOverride.length() > 0) ? dirOverride : audioDir_;
+  return joinPath(dir, fileName);
+}
+
+Status StorageService::ensureDirectories() {
+  Status st = ensureDirectoryExists(imageDir_);
+  if (!st.ok()) return st;
+  return ensureDirectoryExists(audioDir_);
+}
+
 Status AudioService::lockState() {
   if (!stateMutex_) {
     return Status::Error(StatusCode::IOError, "audio mutex unavailable");

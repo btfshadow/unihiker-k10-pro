@@ -321,13 +321,35 @@ class CameraService {
 
 class StorageService {
  public:
-  explicit StorageService(IBoardHal &hal) : hal_(hal) {}
+  explicit StorageService(IBoardHal &hal)
+      : hal_(hal), imageDir_("S:/images"), audioDir_("S:/audio") {}
 
   Status initSd();
   Status savePhotoBmp(const String &path);
 
+  // Default folders by format (user can override via setters or per call).
+  Status setImageDirectory(const String &dir);
+  Status setAudioDirectory(const String &dir);
+  String imageDirectory() const;
+  String audioDirectory() const;
+
+  // Builds full API paths like "S:/images/photo.bmp" and
+  // "S:/audio/clip.wav". Optional dirOverride can customize target folder.
+  String imagePath(const String &fileName, const String &dirOverride = "") const;
+  String audioPath(const String &fileName, const String &dirOverride = "") const;
+
+  // Creates default format directories if missing.
+  Status ensureDirectories();
+
  private:
+  String normalizeDirectory(const String &dir) const;
+  String normalizeFileName(const String &fileName) const;
+  String joinPath(const String &dir, const String &fileName) const;
+  Status ensureDirectoryExists(const String &dir) const;
+
   IBoardHal &hal_;
+  String imageDir_;
+  String audioDir_;
 };
 
 class AudioService {
