@@ -4,8 +4,6 @@
 
 using namespace unihiker_pro;
 
-extern SemaphoreHandle_t xSPIlMutex;
-
 UniHikerPro board;
 static TaskHandle_t gRecordTask = nullptr;
 static volatile bool gRecordRunning = false;
@@ -16,60 +14,6 @@ static volatile uint32_t gRecordBytes = 0;
 static uint32_t gRecordStartMs = 0;
 
 static String gRecordApiPath = "S:/audio/audio_test.wav";
-
-static void fillWavHeader(uint8_t *header, uint32_t dataSize,
-                          uint32_t sampleRate = 16000,
-                          uint16_t channels = 2,
-                          uint16_t bitsPerSample = 16) {
-  uint32_t byteRate = sampleRate * channels * (bitsPerSample / 8);
-  uint16_t blockAlign = channels * (bitsPerSample / 8);
-  uint32_t riffSize = dataSize + 36;
-
-  header[0] = 'R';
-  header[1] = 'I';
-  header[2] = 'F';
-  header[3] = 'F';
-  header[4] = (uint8_t)(riffSize & 0xFF);
-  header[5] = (uint8_t)((riffSize >> 8) & 0xFF);
-  header[6] = (uint8_t)((riffSize >> 16) & 0xFF);
-  header[7] = (uint8_t)((riffSize >> 24) & 0xFF);
-  header[8] = 'W';
-  header[9] = 'A';
-  header[10] = 'V';
-  header[11] = 'E';
-  header[12] = 'f';
-  header[13] = 'm';
-  header[14] = 't';
-  header[15] = ' ';
-  header[16] = 16;
-  header[17] = 0;
-  header[18] = 0;
-  header[19] = 0;
-  header[20] = 1;
-  header[21] = 0;
-  header[22] = (uint8_t)(channels & 0xFF);
-  header[23] = (uint8_t)((channels >> 8) & 0xFF);
-  header[24] = (uint8_t)(sampleRate & 0xFF);
-  header[25] = (uint8_t)((sampleRate >> 8) & 0xFF);
-  header[26] = (uint8_t)((sampleRate >> 16) & 0xFF);
-  header[27] = (uint8_t)((sampleRate >> 24) & 0xFF);
-  header[28] = (uint8_t)(byteRate & 0xFF);
-  header[29] = (uint8_t)((byteRate >> 8) & 0xFF);
-  header[30] = (uint8_t)((byteRate >> 16) & 0xFF);
-  header[31] = (uint8_t)((byteRate >> 24) & 0xFF);
-  header[32] = (uint8_t)(blockAlign & 0xFF);
-  header[33] = (uint8_t)((blockAlign >> 8) & 0xFF);
-  header[34] = (uint8_t)(bitsPerSample & 0xFF);
-  header[35] = (uint8_t)((bitsPerSample >> 8) & 0xFF);
-  header[36] = 'd';
-  header[37] = 'a';
-  header[38] = 't';
-  header[39] = 'a';
-  header[40] = (uint8_t)(dataSize & 0xFF);
-  header[41] = (uint8_t)((dataSize >> 8) & 0xFF);
-  header[42] = (uint8_t)((dataSize >> 16) & 0xFF);
-  header[43] = (uint8_t)((dataSize >> 24) & 0xFF);
-}
 
 static void drawState(const char *line1, const char *line2, uint32_t color = 0x000000) {
   auto &d = board.display();
@@ -89,43 +33,9 @@ static void recordTask(void *arg) {
   gRecordSuccess = false;
   gRecordBytes = 0;
 
-  lv_fs_file_t file;
-  lv_fs_res_t ret;
-  if (xSPIlMutex) {
-    xSemaphoreTake(xSPIlMutex, portMAX_DELAY);
-  }
-  ret = lv_fs_open(&file, gRecordApiPath.c_str(), LV_FS_MODE_WR);
-  if (xSPIlMutex) {
-    xSemaphoreGive(xSPIlMutex);
-  }
-  if (ret != LV_FS_RES_OK) {
-    USBSerial.println("record task: lv_fs_open write failed");
-    gRecordRunning = false;
-    gRecordFinished = true;
-    gRecordTask = nullptr;
-    vTaskDelete(nullptr);
-    return;
-  }
-
-  uint8_t wavHeader[44];
-  fillWavHeader(wavHeader, 0);
-  uint32_t written = 0;
-  if (xSPIlMutex) {
-    xSemaphoreTake(xSPIlMutex, portMAX_DELAY);
-  }
-  ret = lv_fs_write(&file, wavHeader, sizeof(wavHeader), &written);
-  if (xSPIlMutex) {
-    xSemaphoreGive(xSPIlMutex);
-  }
-  if (ret != LV_FS_RES_OK || written != sizeof(wavHeader)) {
-    USBSerial.println("record task: write wav header failed");
-    if (xSPIlMutex) {
-      xSemaphoreTake(xSPIlMutex, portMAX_DELAY);
-    }
-    lv_fs_close(&file);
-    if (xSPIlMutex) {
-      xSemaphoreGive(xSPIlMutex);
-    }
+  Status wavStart = board.storage().beginWavRecord(gRecordApiPath);
+  if (!wavStart.ok()) {
+    USBSerial.printf("record task: beginWavRecord failed (%s)\n", wavStart.message);
     gRecordRunning = false;
     gRecordFinished = true;
     gRecordTask = nullptr;
@@ -147,16 +57,9 @@ static void recordTask(void *arg) {
     if (bytesRead == 0) {
       continue;
     }
-    written = 0;
-    if (xSPIlMutex) {
-      xSemaphoreTake(xSPIlMutex, portMAX_DELAY);
-    }
-    ret = lv_fs_write(&file, buffer, (uint32_t)bytesRead, &written);
-    if (xSPIlMutex) {
-      xSemaphoreGive(xSPIlMutex);
-    }
-    if (ret != LV_FS_RES_OK || written != bytesRead) {
-      USBSerial.println("record task: write chunk failed");
+    Status appendSt = board.storage().appendWavRecord(buffer, bytesRead);
+    if (!appendSt.ok()) {
+      USBSerial.printf("record task: appendWavRecord failed (%s)\n", appendSt.message);
       writeError = true;
       break;
     }
@@ -169,52 +72,13 @@ static void recordTask(void *arg) {
 
   board.pins().write(BoardPin::AmpGain, false);
 
-  if (!writeError) {
-    fillWavHeader(wavHeader, gRecordBytes);
-    if (xSPIlMutex) {
-      xSemaphoreTake(xSPIlMutex, portMAX_DELAY);
-    }
-    ret = lv_fs_seek(&file, 0, LV_FS_SEEK_SET);
-    if (ret == LV_FS_RES_OK) {
-      written = 0;
-      ret = lv_fs_write(&file, wavHeader, sizeof(wavHeader), &written);
-      if (ret != LV_FS_RES_OK || written != sizeof(wavHeader)) {
-        writeError = true;
-      }
-    } else {
-      writeError = true;
-    }
-    if (xSPIlMutex) {
-      xSemaphoreGive(xSPIlMutex);
-    }
+  Status wavEnd = board.storage().endWavRecord(!writeError);
+  if (!wavEnd.ok()) {
+    USBSerial.printf("record task: endWavRecord failed (%s)\n", wavEnd.message);
+    writeError = true;
   }
 
-  if (xSPIlMutex) {
-    xSemaphoreTake(xSPIlMutex, portMAX_DELAY);
-  }
-  lv_fs_close(&file);
-  if (xSPIlMutex) {
-    xSemaphoreGive(xSPIlMutex);
-  }
-
-  uint32_t verifySize = 0;
-  if (!writeError) {
-    lv_fs_file_t verify;
-    if (xSPIlMutex) {
-      xSemaphoreTake(xSPIlMutex, portMAX_DELAY);
-    }
-    ret = lv_fs_open(&verify, gRecordApiPath.c_str(), LV_FS_MODE_RD);
-    if (ret == LV_FS_RES_OK) {
-      (void)lv_fs_seek(&verify, 0, LV_FS_SEEK_END);
-      (void)lv_fs_tell(&verify, &verifySize);
-      lv_fs_close(&verify);
-    }
-    if (xSPIlMutex) {
-      xSemaphoreGive(xSPIlMutex);
-    }
-  }
-
-  gRecordSuccess = !writeError && verifySize > 44;
+  gRecordSuccess = !writeError;
 
   gRecordRunning = false;
   gRecordFinished = true;

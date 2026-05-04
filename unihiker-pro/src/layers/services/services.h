@@ -5,6 +5,7 @@
 #include <Arduino.h>
 #include <AIRecognition.h>
 #include <esp_camera.h>
+#include <FS.h>
 #include <freertos/FreeRTOS.h>
 #include <freertos/semphr.h>
 #include <unihiker_k10.h>
@@ -230,6 +231,14 @@ struct CameraLiveOptions {
   uint32_t longPressMs = InputService::kDefaultLongPressMs;
 };
 
+struct StorageHealth {
+  bool sdReady = false;
+  bool cardPresent = false;
+  bool readWriteOk = false;
+  uint64_t totalBytes = 0;
+  uint64_t usedBytes = 0;
+};
+
 class CameraService {
  public:
   explicit CameraService(IBoardHal &hal, InputService *input = nullptr)
@@ -322,26 +331,111 @@ class CameraService {
 class StorageService {
  public:
   explicit StorageService(IBoardHal &hal)
-      : hal_(hal), imageDir_("S:/images"), audioDir_("S:/audio") {}
+      : hal_(hal),
+        imageDir_("S:/images"),
+        audioDir_("S:/audio"),
+        dataDir_("S:/data"),
+      lastReadBytes_(0),
+        wavDataBytes_(0),
+        wavSampleRate_(16000),
+        wavChannels_(2),
+        wavBitsPerSample_(16) {}
 
   Status initSd();
+    Status healthCheck(StorageHealth &out, bool writeProbe = true);
   Status savePhotoBmp(const String &path);
 
   // Default folders by format (user can override via setters or per call).
   Status setImageDirectory(const String &dir);
   Status setAudioDirectory(const String &dir);
+  Status setDataDirectory(const String &dir);
   String imageDirectory() const;
   String audioDirectory() const;
+  String dataDirectory() const;
 
   // Builds full API paths like "S:/images/photo.bmp" and
   // "S:/audio/clip.wav". Optional dirOverride can customize target folder.
   String imagePath(const String &fileName, const String &dirOverride = "") const;
   String audioPath(const String &fileName, const String &dirOverride = "") const;
+  String dataPath(const String &fileName, const String &dirOverride = "") const;
 
   // Creates default format directories if missing.
   Status ensureDirectories();
 
+  // Writes an RGB565 BMP file (16-bit BI_BITFIELDS).
+  // - fileNameOrPath: file name (uses default/custom image dir) or full S:/ path
+  // - dirOverride: optional directory used when fileNameOrPath is only a file name
+  Status writeRgb565Bmp(const String &fileNameOrPath,
+                        int32_t width,
+                        int32_t height,
+                        const uint16_t *pixels,
+                        const String &dirOverride = "");
+
+  // Centralized WAV (PCM) writer lifecycle for streaming record flows.
+  // beginWavRecord() opens/creates target file and writes placeholder header.
+  // appendWavRecord() appends raw PCM payload chunks.
+  // endWavRecord() rewrites final header; keepFile=false discards partial file.
+  Status beginWavRecord(const String &fileNameOrPath,
+                        uint32_t sampleRate = 16000,
+                        uint16_t channels = 2,
+                        uint16_t bitsPerSample = 16,
+                        const String &dirOverride = "");
+  Status appendWavRecord(const uint8_t *data, size_t bytes);
+  Status endWavRecord(bool keepFile = true);
+  uint32_t wavRecordedBytes() const { return wavDataBytes_; }
+
+  // Generic helpers for metadata/log formats.
+  Status writeTextFile(const String &fileNameOrPath,
+                       const String &content,
+                       const String &dirOverride = "");
+  Status appendTextFile(const String &fileNameOrPath,
+                        const String &content,
+                        const String &dirOverride = "");
+  Status writeBinaryFile(const String &fileNameOrPath,
+                         const uint8_t *data,
+                         size_t bytes,
+                         const String &dirOverride = "");
+  Status appendBinaryFile(const String &fileNameOrPath,
+                          const uint8_t *data,
+                          size_t bytes,
+                          const String &dirOverride = "");
+  Status readTextFile(const String &fileNameOrPath,
+                      String *outContent,
+                      size_t maxBytes = 8192,
+                      const String &dirOverride = "");
+  Status readBinaryFile(const String &fileNameOrPath,
+                        uint8_t *buffer,
+                        size_t capacity,
+                        size_t *outBytes,
+                        const String &dirOverride = "");
+  Status fileExists(const String &fileNameOrPath,
+                    bool *outExists,
+                    const String &dirOverride = "");
+  Status fileSize(const String &fileNameOrPath,
+                  uint32_t *outSize,
+                  const String &dirOverride = "");
+  Status removeFile(const String &fileNameOrPath,
+                    const String &dirOverride = "");
+  size_t lastReadBytes() const { return lastReadBytes_; }
+
+  // Convenience aliases for common text formats.
+  Status writeJson(const String &fileNameOrPath,
+                   const String &json,
+                   const String &dirOverride = "");
+  Status writeCsv(const String &fileNameOrPath,
+                  const String &csv,
+                  const String &dirOverride = "");
+
  private:
+  Status resolveApiPath(const String &fileNameOrPath,
+                        const String &defaultDir,
+                        const String &dirOverride,
+                        String *outPath) const;
+  Status writeWavHeader(File &file,
+                        uint32_t dataSize,
+                        uint32_t sampleRate,
+                        uint16_t channels,
+                        uint16_t bitsPerSample) const;
   String normalizeDirectory(const String &dir) const;
   String normalizeFileName(const String &fileName) const;
   String joinPath(const String &dir, const String &fileName) const;
@@ -350,6 +444,16 @@ class StorageService {
   IBoardHal &hal_;
   String imageDir_;
   String audioDir_;
+  String dataDir_;
+  size_t lastReadBytes_;
+
+  File wavFile_;
+  String wavApiPath_;
+  String wavSdPath_;
+  uint32_t wavDataBytes_;
+  uint32_t wavSampleRate_;
+  uint16_t wavChannels_;
+  uint16_t wavBitsPerSample_;
 };
 
 class AudioService {
@@ -391,19 +495,32 @@ class AudioService {
 class VisionService {
  public:
   VisionService(IBoardHal &boardHal, IVisionHal &visionHal)
-      : boardHal_(boardHal), visionHal_(visionHal), currentMode_(AiMode::None) {}
+      : boardHal_(boardHal),
+        visionHal_(visionHal),
+        currentMode_(AiMode::None),
+        initialized_(false),
+        stateMutex_(xSemaphoreCreateMutex()),
+        modeSwitchCount_(0) {}
 
   Status init();
   Status setMode(AiMode mode);
+  AiMode mode() const { return currentMode_; }
+  uint32_t modeSwitchCount() const { return modeSwitchCount_; }
   bool detected();
   int faceData(AIRecognition::eFaceOrCatData_t type);
   int catData(AIRecognition::eFaceOrCatData_t type);
   String qrPayload();
 
  private:
+  Status lockState();
+  void unlockState();
+
   IBoardHal &boardHal_;
   IVisionHal &visionHal_;
   AiMode currentMode_;
+  bool initialized_;
+  SemaphoreHandle_t stateMutex_;
+  uint32_t modeSwitchCount_;
 };
 
 class SpeechService {

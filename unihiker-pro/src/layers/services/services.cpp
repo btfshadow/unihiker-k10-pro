@@ -13,6 +13,7 @@
 #include <who_camera.h>
 
 extern "C" void lv_fs_fatfs_init(void);
+extern SemaphoreHandle_t xSPIlMutex __attribute__((weak));
 
 namespace unihiker_pro {
 
@@ -125,6 +126,18 @@ static bool toSdFsPath(const String &rawPath, String *outPath) {
   if (!rawPath.startsWith("S:/")) return false;
   *outPath = rawPath.substring(2);
   return outPath->length() > 0;
+}
+
+static void lockSpiStorageBus() {
+  if (xSPIlMutex) {
+    xSemaphoreTake(xSPIlMutex, portMAX_DELAY);
+  }
+}
+
+static void unlockSpiStorageBus() {
+  if (xSPIlMutex) {
+    xSemaphoreGive(xSPIlMutex);
+  }
 }
 }  // namespace
 
@@ -1217,6 +1230,54 @@ Status StorageService::initSd() {
   return ensureSdReadyNoLoop();
 }
 
+Status StorageService::healthCheck(StorageHealth &out, bool writeProbe) {
+  out = StorageHealth();
+
+  if (!hal_.isReady()) {
+    return Status::Error(StatusCode::NotInitialized, "board not initialized");
+  }
+
+  Status st = ensureSdReadyNoLoop();
+  if (!st.ok()) {
+    return st;
+  }
+
+  out.sdReady = true;
+
+#if defined(CARD_NONE)
+  out.cardPresent = SD.cardType() != CARD_NONE;
+#else
+  out.cardPresent = true;
+#endif
+
+  out.totalBytes = (uint64_t)SD.totalBytes();
+  out.usedBytes = (uint64_t)SD.usedBytes();
+
+  if (!writeProbe) {
+    out.readWriteOk = out.cardPresent;
+    return Status::OkStatus();
+  }
+
+  static const uint8_t kProbeData[] = {0x55, 0xAA, 0x10, 0x4B};
+  st = writeBinaryFile("health_probe.bin", kProbeData, sizeof(kProbeData));
+  if (!st.ok()) {
+    out.readWriteOk = false;
+    return st;
+  }
+
+  bool exists = false;
+  (void)fileExists("health_probe.bin", &exists);
+  uint32_t size = 0;
+  (void)fileSize("health_probe.bin", &size);
+  (void)removeFile("health_probe.bin");
+
+  out.readWriteOk = exists && size == sizeof(kProbeData);
+  if (!out.readWriteOk) {
+    return Status::Error(StatusCode::IOError, "storage probe failed");
+  }
+  return Status::OkStatus();
+}
+
 Status StorageService::savePhotoBmp(const String &path) {
   if (!hal_.isReady()) {
     return Status::Error(StatusCode::NotInitialized, "board not initialized");
@@ -1226,6 +1287,85 @@ Status StorageService::savePhotoBmp(const String &path) {
     return sdStatus;
   }
   hal_.board().photoSaveToTFCard(path);
+  return Status::OkStatus();
+}
+
+Status StorageService::resolveApiPath(const String &fileNameOrPath,
+                                      const String &defaultDir,
+                                      const String &dirOverride,
+                                      String *outPath) const {
+  if (outPath == nullptr) {
+    return Status::Error(StatusCode::InvalidArgument, "outPath is null");
+  }
+
+  String path = fileNameOrPath;
+  path.trim();
+  if (path.length() == 0) {
+    return Status::Error(StatusCode::InvalidArgument, "path is empty");
+  }
+
+  if (path.startsWith("S:/")) {
+    *outPath = path;
+    return Status::OkStatus();
+  }
+
+  const String &baseDir = (dirOverride.length() > 0) ? dirOverride : defaultDir;
+  *outPath = joinPath(baseDir, path);
+  return Status::OkStatus();
+}
+
+Status StorageService::writeWavHeader(File &file,
+                                      uint32_t dataSize,
+                                      uint32_t sampleRate,
+                                      uint16_t channels,
+                                      uint16_t bitsPerSample) const {
+  if (!file) {
+    return Status::Error(StatusCode::NotInitialized, "wav file not open");
+  }
+  if (sampleRate == 0 || channels == 0 || bitsPerSample == 0) {
+    return Status::Error(StatusCode::InvalidArgument, "invalid wav format");
+  }
+
+  uint8_t header[44];
+  memset(header, 0, sizeof(header));
+
+  const uint32_t byteRate = sampleRate * (uint32_t)channels * (uint32_t)(bitsPerSample / 8U);
+  const uint16_t blockAlign = (uint16_t)(channels * (uint16_t)(bitsPerSample / 8U));
+  const uint32_t riffSize = dataSize + 36U;
+
+  header[0] = 'R'; header[1] = 'I'; header[2] = 'F'; header[3] = 'F';
+  header[4] = (uint8_t)(riffSize & 0xFF);
+  header[5] = (uint8_t)((riffSize >> 8) & 0xFF);
+  header[6] = (uint8_t)((riffSize >> 16) & 0xFF);
+  header[7] = (uint8_t)((riffSize >> 24) & 0xFF);
+  header[8] = 'W'; header[9] = 'A'; header[10] = 'V'; header[11] = 'E';
+  header[12] = 'f'; header[13] = 'm'; header[14] = 't'; header[15] = ' ';
+  header[16] = 16; header[17] = 0; header[18] = 0; header[19] = 0;
+  header[20] = 1; header[21] = 0;
+  header[22] = (uint8_t)(channels & 0xFF);
+  header[23] = (uint8_t)((channels >> 8) & 0xFF);
+  header[24] = (uint8_t)(sampleRate & 0xFF);
+  header[25] = (uint8_t)((sampleRate >> 8) & 0xFF);
+  header[26] = (uint8_t)((sampleRate >> 16) & 0xFF);
+  header[27] = (uint8_t)((sampleRate >> 24) & 0xFF);
+  header[28] = (uint8_t)(byteRate & 0xFF);
+  header[29] = (uint8_t)((byteRate >> 8) & 0xFF);
+  header[30] = (uint8_t)((byteRate >> 16) & 0xFF);
+  header[31] = (uint8_t)((byteRate >> 24) & 0xFF);
+  header[32] = (uint8_t)(blockAlign & 0xFF);
+  header[33] = (uint8_t)((blockAlign >> 8) & 0xFF);
+  header[34] = (uint8_t)(bitsPerSample & 0xFF);
+  header[35] = (uint8_t)((bitsPerSample >> 8) & 0xFF);
+  header[36] = 'd'; header[37] = 'a'; header[38] = 't'; header[39] = 'a';
+  header[40] = (uint8_t)(dataSize & 0xFF);
+  header[41] = (uint8_t)((dataSize >> 8) & 0xFF);
+  header[42] = (uint8_t)((dataSize >> 16) & 0xFF);
+  header[43] = (uint8_t)((dataSize >> 24) & 0xFF);
+
+  size_t wrote = file.write(header, sizeof(header));
+  if (wrote != sizeof(header)) {
+    return Status::Error(StatusCode::IOError, "failed to write wav header");
+  }
   return Status::OkStatus();
 }
 
@@ -1334,9 +1474,16 @@ Status StorageService::setAudioDirectory(const String &dir) {
   return Status::OkStatus();
 }
 
+Status StorageService::setDataDirectory(const String &dir) {
+  dataDir_ = normalizeDirectory(dir);
+  return Status::OkStatus();
+}
+
 String StorageService::imageDirectory() const { return imageDir_; }
 
 String StorageService::audioDirectory() const { return audioDir_; }
+
+String StorageService::dataDirectory() const { return dataDir_; }
 
 String StorageService::imagePath(const String &fileName,
                                  const String &dirOverride) const {
@@ -1350,10 +1497,712 @@ String StorageService::audioPath(const String &fileName,
   return joinPath(dir, fileName);
 }
 
+String StorageService::dataPath(const String &fileName,
+                                const String &dirOverride) const {
+  const String &dir = (dirOverride.length() > 0) ? dirOverride : dataDir_;
+  return joinPath(dir, fileName);
+}
+
 Status StorageService::ensureDirectories() {
   Status st = ensureDirectoryExists(imageDir_);
   if (!st.ok()) return st;
-  return ensureDirectoryExists(audioDir_);
+  st = ensureDirectoryExists(audioDir_);
+  if (!st.ok()) return st;
+  return ensureDirectoryExists(dataDir_);
+}
+
+Status StorageService::writeRgb565Bmp(const String &fileNameOrPath,
+                                      int32_t width,
+                                      int32_t height,
+                                      const uint16_t *pixels,
+                                      const String &dirOverride) {
+  if (!hal_.isReady()) {
+    return Status::Error(StatusCode::NotInitialized, "board not initialized");
+  }
+  if (width <= 0 || height <= 0 || pixels == nullptr) {
+    return Status::Error(StatusCode::InvalidArgument, "invalid bmp params");
+  }
+
+  String apiPath = fileNameOrPath;
+  if (!apiPath.startsWith("S:/")) {
+    apiPath = imagePath(fileNameOrPath, dirOverride);
+  }
+
+  int slash = apiPath.lastIndexOf('/');
+  if (slash < 3) {
+    return Status::Error(StatusCode::InvalidArgument, "invalid bmp path");
+  }
+
+  Status st = ensureSdReadyNoLoop();
+  if (!st.ok()) return st;
+
+  String targetDir = apiPath.substring(0, slash);
+  st = ensureDirectoryExists(targetDir);
+  if (!st.ok()) return st;
+
+  String sdPath;
+  if (!toSdFsPath(apiPath, &sdPath)) {
+    return Status::Error(StatusCode::InvalidArgument, "invalid bmp path prefix");
+  }
+  if (!sdPath.startsWith("/")) {
+    sdPath = "/" + sdPath;
+  }
+
+  uint64_t rowBytes64 = (uint64_t)(uint32_t)width * 2ULL;
+  uint64_t pixelData64 = rowBytes64 * (uint64_t)(uint32_t)height;
+  if (rowBytes64 > SIZE_MAX || pixelData64 > 0xFFFFFFFFULL) {
+    return Status::Error(StatusCode::InvalidArgument, "bmp dimensions too large");
+  }
+
+  if (SD.exists(sdPath.c_str())) {
+    (void)SD.remove(sdPath.c_str());
+  }
+
+  File f = SD.open(sdPath.c_str(), FILE_WRITE);
+  if (!f) {
+    return Status::Error(StatusCode::IOError, "failed to open bmp for write");
+  }
+
+  const uint32_t rowBytes = (uint32_t)rowBytes64;
+  const uint32_t pixelData = (uint32_t)pixelData64;
+
+  BmpHdr hdr;
+  hdr.bfType          = 0x4D42;
+  hdr.fileSize        = (uint32_t)sizeof(BmpHdr) + pixelData;
+  hdr.reserved1       = 0;
+  hdr.reserved2       = 0;
+  hdr.offset          = sizeof(BmpHdr);
+  hdr.headerSize      = 40;
+  hdr.width           = width;
+  hdr.height          = height;
+  hdr.planes          = 1;
+  hdr.bitsPerPixel    = 16;
+  hdr.compression     = 3;
+  hdr.dataSize        = pixelData;
+  hdr.hRes            = 0;
+  hdr.vRes            = 0;
+  hdr.colors          = 0;
+  hdr.importantColors = 0;
+  hdr.maskR           = 0xF800;
+  hdr.maskG           = 0x07E0;
+  hdr.maskB           = 0x001F;
+
+  if (f.write(reinterpret_cast<const uint8_t *>(&hdr), sizeof(hdr)) != sizeof(hdr)) {
+    f.close();
+    return Status::Error(StatusCode::IOError, "failed to write bmp header");
+  }
+
+  uint8_t *rowBuf = reinterpret_cast<uint8_t *>(malloc((size_t)rowBytes));
+  if (!rowBuf) {
+    f.close();
+    return Status::Error(StatusCode::IOError, "bmp row buffer alloc failed");
+  }
+
+  bool ok = true;
+  for (int32_t row = height - 1; row >= 0; --row) {
+    const uint16_t *src = pixels + (size_t)row * (size_t)width;
+    for (int32_t col = 0; col < width; ++col) {
+      uint16_t px = src[col];
+      rowBuf[col * 2] = (uint8_t)(px & 0xFF);
+      rowBuf[col * 2 + 1] = (uint8_t)(px >> 8);
+    }
+
+    if (f.write(rowBuf, rowBytes) != rowBytes) {
+      ok = false;
+      break;
+    }
+  }
+
+  free(rowBuf);
+  f.flush();
+  f.close();
+
+  if (!ok) {
+    return Status::Error(StatusCode::IOError, "failed to write bmp data");
+  }
+
+  return Status::OkStatus();
+}
+
+Status StorageService::beginWavRecord(const String &fileNameOrPath,
+                                      uint32_t sampleRate,
+                                      uint16_t channels,
+                                      uint16_t bitsPerSample,
+                                      const String &dirOverride) {
+  if (!hal_.isReady()) {
+    return Status::Error(StatusCode::NotInitialized, "board not initialized");
+  }
+  if (sampleRate == 0 || channels == 0 || bitsPerSample == 0) {
+    return Status::Error(StatusCode::InvalidArgument, "invalid wav format");
+  }
+  if (wavFile_) {
+    return Status::Error(StatusCode::Busy, "wav writer already active");
+  }
+
+  String apiPath;
+  Status st = resolveApiPath(fileNameOrPath, audioDir_, dirOverride, &apiPath);
+  if (!st.ok()) return st;
+
+  int slash = apiPath.lastIndexOf('/');
+  if (slash < 3) {
+    return Status::Error(StatusCode::InvalidArgument, "invalid wav path");
+  }
+
+  st = ensureSdReadyNoLoop();
+  if (!st.ok()) return st;
+
+  String targetDir = apiPath.substring(0, slash);
+  st = ensureDirectoryExists(targetDir);
+  if (!st.ok()) return st;
+
+  String sdPath;
+  if (!toSdFsPath(apiPath, &sdPath)) {
+    return Status::Error(StatusCode::InvalidArgument, "invalid wav path prefix");
+  }
+  if (!sdPath.startsWith("/")) {
+    sdPath = "/" + sdPath;
+  }
+
+  lockSpiStorageBus();
+  if (SD.exists(sdPath.c_str())) {
+    (void)SD.remove(sdPath.c_str());
+  }
+
+  wavFile_ = SD.open(sdPath.c_str(), FILE_WRITE);
+  if (!wavFile_) {
+    unlockSpiStorageBus();
+    return Status::Error(StatusCode::IOError, "failed to open wav for write");
+  }
+
+  wavDataBytes_ = 0;
+  wavSampleRate_ = sampleRate;
+  wavChannels_ = channels;
+  wavBitsPerSample_ = bitsPerSample;
+  wavApiPath_ = apiPath;
+  wavSdPath_ = sdPath;
+
+  st = writeWavHeader(wavFile_, 0, wavSampleRate_, wavChannels_, wavBitsPerSample_);
+  if (!st.ok()) {
+    wavFile_.close();
+    (void)SD.remove(sdPath.c_str());
+    wavApiPath_ = "";
+    wavSdPath_ = "";
+    wavDataBytes_ = 0;
+    unlockSpiStorageBus();
+    return st;
+  }
+
+  wavFile_.flush();
+  unlockSpiStorageBus();
+  return Status::OkStatus();
+}
+
+Status StorageService::appendWavRecord(const uint8_t *data, size_t bytes) {
+  if (!wavFile_) {
+    return Status::Error(StatusCode::NotInitialized, "wav writer not active");
+  }
+  if (bytes == 0) {
+    return Status::OkStatus();
+  }
+  if (data == nullptr) {
+    return Status::Error(StatusCode::InvalidArgument, "wav chunk is null");
+  }
+
+  lockSpiStorageBus();
+  size_t wrote = wavFile_.write(data, bytes);
+  unlockSpiStorageBus();
+
+  if (wrote != bytes) {
+    return Status::Error(StatusCode::IOError, "failed to append wav data");
+  }
+
+  if (wavDataBytes_ > 0xFFFFFFFFUL - (uint32_t)bytes) {
+    return Status::Error(StatusCode::InvalidArgument, "wav data too large");
+  }
+  wavDataBytes_ += (uint32_t)bytes;
+  return Status::OkStatus();
+}
+
+Status StorageService::endWavRecord(bool keepFile) {
+  if (!wavFile_) {
+    return Status::Error(StatusCode::NotInitialized, "wav writer not active");
+  }
+
+  lockSpiStorageBus();
+
+  if (!keepFile) {
+    wavFile_.close();
+    (void)SD.remove(wavSdPath_.c_str());
+    wavApiPath_ = "";
+    wavSdPath_ = "";
+    wavDataBytes_ = 0;
+    unlockSpiStorageBus();
+    return Status::OkStatus();
+  }
+
+  if (!wavFile_.seek(0)) {
+    wavFile_.close();
+    (void)SD.remove(wavSdPath_.c_str());
+    wavApiPath_ = "";
+    wavSdPath_ = "";
+    wavDataBytes_ = 0;
+    unlockSpiStorageBus();
+    return Status::Error(StatusCode::IOError, "failed to seek wav header");
+  }
+
+  Status st = writeWavHeader(wavFile_, wavDataBytes_, wavSampleRate_, wavChannels_,
+                             wavBitsPerSample_);
+  if (!st.ok()) {
+    wavFile_.close();
+    (void)SD.remove(wavSdPath_.c_str());
+    wavApiPath_ = "";
+    wavSdPath_ = "";
+    wavDataBytes_ = 0;
+    unlockSpiStorageBus();
+    return st;
+  }
+
+  wavFile_.flush();
+  wavFile_.close();
+
+  File verify = SD.open(wavSdPath_.c_str(), FILE_READ);
+  bool fileOk = verify && verify.size() > 44;
+  if (verify) verify.close();
+
+  wavApiPath_ = "";
+  wavSdPath_ = "";
+  uint32_t finalBytes = wavDataBytes_;
+  wavDataBytes_ = 0;
+
+  unlockSpiStorageBus();
+
+  if (!fileOk || finalBytes == 0) {
+    return Status::Error(StatusCode::IOError, "wav output not created");
+  }
+  return Status::OkStatus();
+}
+
+Status StorageService::writeTextFile(const String &fileNameOrPath,
+                                     const String &content,
+                                     const String &dirOverride) {
+  String apiPath;
+  Status st = resolveApiPath(fileNameOrPath, dataDir_, dirOverride, &apiPath);
+  if (!st.ok()) return st;
+
+  int slash = apiPath.lastIndexOf('/');
+  if (slash < 3) {
+    return Status::Error(StatusCode::InvalidArgument, "invalid text path");
+  }
+
+  st = ensureSdReadyNoLoop();
+  if (!st.ok()) return st;
+
+  String targetDir = apiPath.substring(0, slash);
+  st = ensureDirectoryExists(targetDir);
+  if (!st.ok()) return st;
+
+  String sdPath;
+  if (!toSdFsPath(apiPath, &sdPath)) {
+    return Status::Error(StatusCode::InvalidArgument, "invalid text path prefix");
+  }
+  if (!sdPath.startsWith("/")) {
+    sdPath = "/" + sdPath;
+  }
+
+  lockSpiStorageBus();
+  if (SD.exists(sdPath.c_str())) {
+    (void)SD.remove(sdPath.c_str());
+  }
+
+  File f = SD.open(sdPath.c_str(), FILE_WRITE);
+  if (!f) {
+    unlockSpiStorageBus();
+    return Status::Error(StatusCode::IOError, "failed to open text file");
+  }
+
+  const char *raw = content.c_str();
+  size_t len = content.length();
+  size_t wrote = (len == 0) ? 0 : f.write(reinterpret_cast<const uint8_t *>(raw), len);
+  f.flush();
+  f.close();
+  unlockSpiStorageBus();
+
+  if (wrote != len) {
+    return Status::Error(StatusCode::IOError, "failed to write text file");
+  }
+  return Status::OkStatus();
+}
+
+Status StorageService::appendTextFile(const String &fileNameOrPath,
+                                      const String &content,
+                                      const String &dirOverride) {
+  String apiPath;
+  Status st = resolveApiPath(fileNameOrPath, dataDir_, dirOverride, &apiPath);
+  if (!st.ok()) return st;
+
+  int slash = apiPath.lastIndexOf('/');
+  if (slash < 3) {
+    return Status::Error(StatusCode::InvalidArgument, "invalid text path");
+  }
+
+  st = ensureSdReadyNoLoop();
+  if (!st.ok()) return st;
+
+  String targetDir = apiPath.substring(0, slash);
+  st = ensureDirectoryExists(targetDir);
+  if (!st.ok()) return st;
+
+  String sdPath;
+  if (!toSdFsPath(apiPath, &sdPath)) {
+    return Status::Error(StatusCode::InvalidArgument, "invalid text path prefix");
+  }
+  if (!sdPath.startsWith("/")) {
+    sdPath = "/" + sdPath;
+  }
+
+  lockSpiStorageBus();
+#if defined(FILE_APPEND)
+  File f = SD.open(sdPath.c_str(), FILE_APPEND);
+#else
+  File f = SD.open(sdPath.c_str(), FILE_WRITE);
+  if (f) {
+    (void)f.seek(f.size());
+  }
+#endif
+  if (!f) {
+    unlockSpiStorageBus();
+    return Status::Error(StatusCode::IOError, "failed to open text file append");
+  }
+
+  const char *raw = content.c_str();
+  size_t len = content.length();
+  size_t wrote = (len == 0) ? 0 : f.write(reinterpret_cast<const uint8_t *>(raw), len);
+  f.flush();
+  f.close();
+  unlockSpiStorageBus();
+
+  if (wrote != len) {
+    return Status::Error(StatusCode::IOError, "failed to append text file");
+  }
+  return Status::OkStatus();
+}
+
+Status StorageService::writeBinaryFile(const String &fileNameOrPath,
+                                       const uint8_t *data,
+                                       size_t bytes,
+                                       const String &dirOverride) {
+  if (bytes > 0 && data == nullptr) {
+    return Status::Error(StatusCode::InvalidArgument, "binary data is null");
+  }
+
+  String apiPath;
+  Status st = resolveApiPath(fileNameOrPath, dataDir_, dirOverride, &apiPath);
+  if (!st.ok()) return st;
+
+  int slash = apiPath.lastIndexOf('/');
+  if (slash < 3) {
+    return Status::Error(StatusCode::InvalidArgument, "invalid binary path");
+  }
+
+  st = ensureSdReadyNoLoop();
+  if (!st.ok()) return st;
+
+  String targetDir = apiPath.substring(0, slash);
+  st = ensureDirectoryExists(targetDir);
+  if (!st.ok()) return st;
+
+  String sdPath;
+  if (!toSdFsPath(apiPath, &sdPath)) {
+    return Status::Error(StatusCode::InvalidArgument, "invalid binary path prefix");
+  }
+  if (!sdPath.startsWith("/")) {
+    sdPath = "/" + sdPath;
+  }
+
+  lockSpiStorageBus();
+  if (SD.exists(sdPath.c_str())) {
+    (void)SD.remove(sdPath.c_str());
+  }
+
+  File f = SD.open(sdPath.c_str(), FILE_WRITE);
+  if (!f) {
+    unlockSpiStorageBus();
+    return Status::Error(StatusCode::IOError, "failed to open binary file");
+  }
+
+  size_t wrote = (bytes == 0) ? 0 : f.write(data, bytes);
+  f.flush();
+  f.close();
+  unlockSpiStorageBus();
+
+  if (wrote != bytes) {
+    return Status::Error(StatusCode::IOError, "failed to write binary file");
+  }
+  return Status::OkStatus();
+}
+
+Status StorageService::appendBinaryFile(const String &fileNameOrPath,
+                                        const uint8_t *data,
+                                        size_t bytes,
+                                        const String &dirOverride) {
+  if (bytes > 0 && data == nullptr) {
+    return Status::Error(StatusCode::InvalidArgument, "binary data is null");
+  }
+
+  String apiPath;
+  Status st = resolveApiPath(fileNameOrPath, dataDir_, dirOverride, &apiPath);
+  if (!st.ok()) return st;
+
+  int slash = apiPath.lastIndexOf('/');
+  if (slash < 3) {
+    return Status::Error(StatusCode::InvalidArgument, "invalid binary path");
+  }
+
+  st = ensureSdReadyNoLoop();
+  if (!st.ok()) return st;
+
+  String targetDir = apiPath.substring(0, slash);
+  st = ensureDirectoryExists(targetDir);
+  if (!st.ok()) return st;
+
+  String sdPath;
+  if (!toSdFsPath(apiPath, &sdPath)) {
+    return Status::Error(StatusCode::InvalidArgument, "invalid binary path prefix");
+  }
+  if (!sdPath.startsWith("/")) {
+    sdPath = "/" + sdPath;
+  }
+
+  lockSpiStorageBus();
+#if defined(FILE_APPEND)
+  File f = SD.open(sdPath.c_str(), FILE_APPEND);
+#else
+  File f = SD.open(sdPath.c_str(), FILE_WRITE);
+  if (f) {
+    (void)f.seek(f.size());
+  }
+#endif
+  if (!f) {
+    unlockSpiStorageBus();
+    return Status::Error(StatusCode::IOError, "failed to open binary file append");
+  }
+
+  size_t wrote = (bytes == 0) ? 0 : f.write(data, bytes);
+  f.flush();
+  f.close();
+  unlockSpiStorageBus();
+
+  if (wrote != bytes) {
+    return Status::Error(StatusCode::IOError, "failed to append binary file");
+  }
+  return Status::OkStatus();
+}
+
+Status StorageService::readTextFile(const String &fileNameOrPath,
+                                    String *outContent,
+                                    size_t maxBytes,
+                                    const String &dirOverride) {
+  if (outContent == nullptr) {
+    return Status::Error(StatusCode::InvalidArgument, "outContent is null");
+  }
+  if (maxBytes == 0) {
+    return Status::Error(StatusCode::InvalidArgument, "maxBytes must be > 0");
+  }
+
+  String apiPath;
+  Status st = resolveApiPath(fileNameOrPath, dataDir_, dirOverride, &apiPath);
+  if (!st.ok()) return st;
+
+  String sdPath;
+  if (!toSdFsPath(apiPath, &sdPath)) {
+    return Status::Error(StatusCode::InvalidArgument, "invalid text path prefix");
+  }
+  if (!sdPath.startsWith("/")) {
+    sdPath = "/" + sdPath;
+  }
+
+  st = ensureSdReadyNoLoop();
+  if (!st.ok()) return st;
+
+  lockSpiStorageBus();
+  File f = SD.open(sdPath.c_str(), FILE_READ);
+  if (!f) {
+    unlockSpiStorageBus();
+    return Status::Error(StatusCode::IOError, "failed to open text file read");
+  }
+
+  outContent->remove(0);
+  outContent->reserve(maxBytes);
+  size_t count = 0;
+  while (f.available() && count < maxBytes) {
+    int c = f.read();
+    if (c < 0) break;
+    *outContent += (char)c;
+    count++;
+  }
+
+  bool truncated = f.available();
+  f.close();
+  unlockSpiStorageBus();
+
+  lastReadBytes_ = count;
+  if (truncated) {
+    return Status::Error(StatusCode::IOError, "text exceeds maxBytes");
+  }
+  return Status::OkStatus();
+}
+
+Status StorageService::readBinaryFile(const String &fileNameOrPath,
+                                      uint8_t *buffer,
+                                      size_t capacity,
+                                      size_t *outBytes,
+                                      const String &dirOverride) {
+  if (buffer == nullptr || capacity == 0) {
+    return Status::Error(StatusCode::InvalidArgument, "invalid read buffer");
+  }
+
+  String apiPath;
+  Status st = resolveApiPath(fileNameOrPath, dataDir_, dirOverride, &apiPath);
+  if (!st.ok()) return st;
+
+  String sdPath;
+  if (!toSdFsPath(apiPath, &sdPath)) {
+    return Status::Error(StatusCode::InvalidArgument, "invalid binary path prefix");
+  }
+  if (!sdPath.startsWith("/")) {
+    sdPath = "/" + sdPath;
+  }
+
+  st = ensureSdReadyNoLoop();
+  if (!st.ok()) return st;
+
+  lockSpiStorageBus();
+  File f = SD.open(sdPath.c_str(), FILE_READ);
+  if (!f) {
+    unlockSpiStorageBus();
+    return Status::Error(StatusCode::IOError, "failed to open binary file read");
+  }
+
+  size_t readN = f.read(buffer, capacity);
+  bool truncated = f.available();
+  f.close();
+  unlockSpiStorageBus();
+
+  if (outBytes) {
+    *outBytes = readN;
+  }
+  lastReadBytes_ = readN;
+
+  if (truncated) {
+    return Status::Error(StatusCode::IOError, "binary buffer too small");
+  }
+  return Status::OkStatus();
+}
+
+Status StorageService::fileExists(const String &fileNameOrPath,
+                                  bool *outExists,
+                                  const String &dirOverride) {
+  if (outExists == nullptr) {
+    return Status::Error(StatusCode::InvalidArgument, "outExists is null");
+  }
+
+  String apiPath;
+  Status st = resolveApiPath(fileNameOrPath, dataDir_, dirOverride, &apiPath);
+  if (!st.ok()) return st;
+
+  String sdPath;
+  if (!toSdFsPath(apiPath, &sdPath)) {
+    return Status::Error(StatusCode::InvalidArgument, "invalid exists path prefix");
+  }
+  if (!sdPath.startsWith("/")) {
+    sdPath = "/" + sdPath;
+  }
+
+  st = ensureSdReadyNoLoop();
+  if (!st.ok()) return st;
+
+  lockSpiStorageBus();
+  *outExists = SD.exists(sdPath.c_str());
+  unlockSpiStorageBus();
+  return Status::OkStatus();
+}
+
+Status StorageService::fileSize(const String &fileNameOrPath,
+                                uint32_t *outSize,
+                                const String &dirOverride) {
+  if (outSize == nullptr) {
+    return Status::Error(StatusCode::InvalidArgument, "outSize is null");
+  }
+
+  String apiPath;
+  Status st = resolveApiPath(fileNameOrPath, dataDir_, dirOverride, &apiPath);
+  if (!st.ok()) return st;
+
+  String sdPath;
+  if (!toSdFsPath(apiPath, &sdPath)) {
+    return Status::Error(StatusCode::InvalidArgument, "invalid size path prefix");
+  }
+  if (!sdPath.startsWith("/")) {
+    sdPath = "/" + sdPath;
+  }
+
+  st = ensureSdReadyNoLoop();
+  if (!st.ok()) return st;
+
+  lockSpiStorageBus();
+  File f = SD.open(sdPath.c_str(), FILE_READ);
+  if (!f) {
+    unlockSpiStorageBus();
+    return Status::Error(StatusCode::IOError, "failed to open file for size");
+  }
+
+  *outSize = (uint32_t)f.size();
+  f.close();
+  unlockSpiStorageBus();
+  return Status::OkStatus();
+}
+
+Status StorageService::removeFile(const String &fileNameOrPath,
+                                  const String &dirOverride) {
+  String apiPath;
+  Status st = resolveApiPath(fileNameOrPath, dataDir_, dirOverride, &apiPath);
+  if (!st.ok()) return st;
+
+  String sdPath;
+  if (!toSdFsPath(apiPath, &sdPath)) {
+    return Status::Error(StatusCode::InvalidArgument, "invalid remove path prefix");
+  }
+  if (!sdPath.startsWith("/")) {
+    sdPath = "/" + sdPath;
+  }
+
+  st = ensureSdReadyNoLoop();
+  if (!st.ok()) return st;
+
+  lockSpiStorageBus();
+  bool exists = SD.exists(sdPath.c_str());
+  bool removed = true;
+  if (exists) {
+    removed = SD.remove(sdPath.c_str());
+  }
+  unlockSpiStorageBus();
+
+  if (!removed) {
+    return Status::Error(StatusCode::IOError, "failed to remove file");
+  }
+  return Status::OkStatus();
+}
+
+Status StorageService::writeJson(const String &fileNameOrPath,
+                                 const String &json,
+                                 const String &dirOverride) {
+  return writeTextFile(fileNameOrPath, json, dirOverride);
+}
+
+Status StorageService::writeCsv(const String &fileNameOrPath,
+                                const String &csv,
+                                const String &dirOverride) {
+  return writeTextFile(fileNameOrPath, csv, dirOverride);
 }
 
 Status AudioService::lockState() {
@@ -1562,25 +2411,66 @@ Status AudioService::recordFile(const String &path, uint8_t seconds) {
 }
 
 Status VisionService::init() {
+  if (!boardHal_.isReady()) {
+    return Status::Error(StatusCode::NotInitialized, "board not initialized");
+  }
+
+  Status st = lockState();
+  if (!st.ok()) return st;
+
+  if (initialized_) {
+    unlockState();
+    return Status::OkStatus();
+  }
+
   auto status = visionHal_.init();
   if (!status.ok()) {
+    unlockState();
     return status;
   }
+  currentMode_ = AiMode::None;
+  initialized_ = true;
+  modeSwitchCount_ = 0;
+  unlockState();
   return Status::OkStatus();
 }
 
 Status VisionService::setMode(AiMode mode) {
+  Status st = lockState();
+  if (!st.ok()) return st;
+
+  if (!initialized_) {
+    unlockState();
+    return Status::Error(StatusCode::NotInitialized, "vision not initialized");
+  }
+
+  if (mode == currentMode_) {
+    unlockState();
+    return Status::OkStatus();
+  }
+
   auto status = visionHal_.switchMode(mode);
   if (!status.ok()) {
+    unlockState();
     return status;
   }
   currentMode_ = mode;
+  modeSwitchCount_++;
+  unlockState();
   return Status::OkStatus();
 }
 
 bool VisionService::detected() {
+  if (!initialized_) return false;
+
+  Status st = lockState();
+  if (!st.ok()) return false;
+
+  AiMode activeMode = currentMode_;
+  unlockState();
+
   auto &ai = visionHal_.ai();
-  switch (currentMode_) {
+  switch (activeMode) {
     case AiMode::Face:
       return ai.isDetectContent(AIRecognition::Face);
     case AiMode::Cat:
@@ -1596,14 +2486,35 @@ bool VisionService::detected() {
 }
 
 int VisionService::faceData(AIRecognition::eFaceOrCatData_t type) {
+  if (!initialized_) return 0;
   return visionHal_.ai().getFaceData(type);
 }
 
 int VisionService::catData(AIRecognition::eFaceOrCatData_t type) {
+  if (!initialized_) return 0;
   return visionHal_.ai().getCatData(type);
 }
 
-String VisionService::qrPayload() { return visionHal_.ai().getQrCodeContent(); }
+String VisionService::qrPayload() {
+  if (!initialized_) return String();
+  return visionHal_.ai().getQrCodeContent();
+}
+
+Status VisionService::lockState() {
+  if (!stateMutex_) {
+    return Status::Error(StatusCode::IOError, "vision mutex unavailable");
+  }
+  if (xSemaphoreTake(stateMutex_, pdMS_TO_TICKS(300)) != pdTRUE) {
+    return Status::Error(StatusCode::Busy, "vision state busy");
+  }
+  return Status::OkStatus();
+}
+
+void VisionService::unlockState() {
+  if (stateMutex_) {
+    xSemaphoreGive(stateMutex_);
+  }
+}
 
 void SpeechService::begin(uint8_t mode, uint8_t lang, uint16_t wakeUpMs) {
   speechHal_.asr().asrInit(mode, lang, wakeUpMs);
