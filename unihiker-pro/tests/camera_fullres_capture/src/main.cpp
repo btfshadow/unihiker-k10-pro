@@ -1,4 +1,5 @@
 #include <Arduino.h>
+#include <Preferences.h>
 #include <SD.h>
 #include <esp_camera.h>
 #include <string.h>
@@ -9,6 +10,7 @@
 using namespace unihiker_pro;
 
 UniHikerPro board;
+Preferences g_resPrefs;
 
 static bool g_busy = false;
 static bool g_cameraInited = false;
@@ -16,6 +18,8 @@ static bool g_sdReady = false;
 static QueueHandle_t g_frameQueue = nullptr;
 static int g_photoIndex = 0;
 static uint8_t g_resIndex = 0;
+static const char *kPrefsNs = "cam_fullres";
+static const char *kPrefsResKey = "res_idx";
 
 enum class ColorMode : uint8_t {
   Rgb565 = 0,
@@ -71,6 +75,38 @@ static const CaptureMode kModes[] = {
 static const DecodeMode kDecodeModes[] = {
   {"RGB565", ColorMode::Rgb565},
 };
+
+static uint8_t modeCount() {
+  return (uint8_t)(sizeof(kModes) / sizeof(kModes[0]));
+}
+
+static uint8_t clampResIndex(uint32_t index) {
+  uint8_t count = modeCount();
+  if (count == 0) return 0;
+  if (index >= count) return (uint8_t)(count - 1);
+  return (uint8_t)index;
+}
+
+static uint8_t loadSavedResIndex() {
+  uint8_t fallback = 1;
+  if (fallback >= modeCount()) fallback = 0;
+
+  if (!g_resPrefs.begin(kPrefsNs, true)) {
+    return fallback;
+  }
+  uint32_t raw = g_resPrefs.getUInt(kPrefsResKey, fallback);
+  g_resPrefs.end();
+  return clampResIndex(raw);
+}
+
+static bool saveResIndex(uint8_t index) {
+  if (!g_resPrefs.begin(kPrefsNs, false)) {
+    return false;
+  }
+  size_t written = g_resPrefs.putUInt(kPrefsResKey, index);
+  g_resPrefs.end();
+  return written > 0;
+}
 
 static const camera_config_t kCamCfgBase = {
     .pin_pwdn = -1,
@@ -472,14 +508,39 @@ static void drawIdleUi() {
   board.display().textAt(String("Res: ") + kModes[g_resIndex].name, 10, 62, 0xFFFFFF, 29, true);
   board.display().textAt(String("Decode: ") + kDecodeModes[g_decodeModeIndex].name,
                          10, 92, 0xFFFFFF, 28, true);
-  board.display().textAt("A: info", 10, 132, 0x66CCFF, 24, true);
+  board.display().textAt("A: next+reboot", 10, 132, 0x66CCFF, 24, true);
   board.display().textAt("B: capture", 10, 180, 0x66CCFF, 20, true);
   board.display().update();
 }
 
 void onButtonA() {
   if (g_busy) return;
-  USBSerial.printf("camera locked: %s (dynamic switching causes crashes)\n", kModes[g_resIndex].name);
+
+  uint8_t nextIndex = (uint8_t)((g_resIndex + 1) % modeCount());
+  bool ok = saveResIndex(nextIndex);
+
+  if (!ok) {
+    USBSerial.println("failed to save next resolution index");
+    board.display().clearCanvas();
+    board.display().textAt("Save FAIL", 10, 20, 0xFF4444, 20, true);
+    board.display().textAt("NVS write failed", 10, 60, 0xFFFFFF, 22, true);
+    board.display().update();
+    delay(700);
+    drawIdleUi();
+    return;
+  }
+
+  USBSerial.printf("switch request: %s -> %s (saved), rebooting...\n",
+                   kModes[g_resIndex].name,
+                   kModes[nextIndex].name);
+
+  board.display().clearCanvas();
+  board.display().textAt("Switching Res", 10, 20, 0x00FF66, 20, true);
+  board.display().textAt(String("Next: ") + kModes[nextIndex].name, 10, 60, 0xFFFFFF, 24, true);
+  board.display().textAt("Rebooting...", 10, 110, 0x66CCFF, 22, true);
+  board.display().update();
+  delay(500);
+  ESP.restart();
 }
 
 void onButtonB() {
@@ -500,7 +561,7 @@ void onButtonB() {
     if (err.length() > 0) {
       board.display().textAt(err, 10, 146, 0xFFD080, 26, true);
     }
-    board.display().textAt("A fixed / B capture", 10, 176, 0x66CCFF, 24, true);
+    board.display().textAt("A next+reboot / B cap", 10, 176, 0x66CCFF, 24, true);
     board.display().update();
   } else {
     USBSerial.printf("capture failed: %s\n", err.c_str());
@@ -532,8 +593,8 @@ void setup() {
   board.led().off();
   board.pins().write(BoardPin::LcdBacklight, true);
 
-  // Show resolution selector menu at boot
-  bootResolutionSelector();
+  g_resIndex = loadSavedResIndex();
+  USBSerial.printf("loaded resolution index=%u (%s)\n", (unsigned)g_resIndex, kModes[g_resIndex].name);
   
   drawIdleUi();
 
