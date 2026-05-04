@@ -7,6 +7,79 @@
     "/^cd /Volumes/HD-TOP/Project/Unihiker_10kpro/Unihiker-10k-pro/external_packages && mkdir -p /tmp/pdfs_extracted && for f in \\*\\.pdf; do out=\"/tmp/pdfs_extracted/\\$\\{f%\\.pdf\\}\\.txt\"; python3 -c \"\nimport pypdf, sys\nr = pypdf\\.PdfReader\\(sys\\.argv\\[1\\]\\)\nwith open\\(sys\\.argv\\[2\\],'w'\\) as o:\n    for i,p in enumerate\\(r\\.pages\\):\n        o\\.write\\(f'\\\\n===== PAGE \\{i\\+1\\} =====\\\\n'\\)\n        o\\.write\\(p\\.extract_text\\(\\) or ''\\)\n\" \"\\$f\" \"\\$out\"; done && ls -la /tmp/pdfs_extracted/$/": {
       "approve": true,
       "matchCommandLine": true
+    },
+    "/^bash -lc \"strings external_packages/framework-arduinounihiker/tools/sdk/esp32s3/lib/libunihiker_k10\\.a \\| egrep -i 'XL9535\\|xl9535\\|eLCD_BLK\\|eCamera_rst\\|eP11_KeyB\\|eP2\\|digital_write\\|digital_read\\|gpio' \\|\\| true\"$/": {
+      "approve": true,
+      "matchCommandLine": true
+    },
+    "/^bash -lc \"ls -la external_packages/framework-arduinounihiker/tools/sdk/esp32s3/lib/libunihiker_k10\\.a\"$/": {
+      "approve": true,
+      "matchCommandLine": true
+    },
+    "/^bash -lc \"OUTDIR='/Volumes/HD-TOP/Project/Unihiker_10kpro/Unihiker-10k-pro/specs/checkpoints/code/02-edge-connector/artifacts'; strings '/Volumes/HD-TOP/Project/Unihiker_10kpro/Unihiker-10k-pro/external_packages/framework-arduinounihiker/tools/sdk/esp32s3/lib/libESP32_IO_Expander\\.a' \\| egrep -i 'XL9535\\|xl9535' > \"\\$OUTDIR/lib_expander_strings\\.txt\" \\|\\| true; strings '/Volumes/HD-TOP/Project/Unihiker_10kpro/Unihiker-10k-pro/external_packages/framework-arduinounihiker/tools/sdk/esp32s3/lib/libxt_hal\\.a' \\| egrep -i 'eP\\[0-9\\]\\+\\|eLCD_BLK\\|eCamera_rst\\|XL9535\\|digital_write\\|digital_read' > \"\\$OUTDIR/lib_xt_hal_strings\\.txt\" \\|\\| true; strings '/Volumes/HD-TOP/Project/Unihiker_10kpro/Unihiker-10k-pro/external_packages/framework-arduinounihiker/tools/sdk/esp32s3/lib/libunihiker_k10\\.a' \\| egrep -i 'eP\\[0-9\\]\\+\\|eLCD_BLK\\|eCamera_rst\\|XL9535\\|digital_write\\|digital_read' > \"\\$OUTDIR/lib_unihiker_strings\\.txt\" \\|\\| true; ls -la \"\\$OUTDIR\"$/": {
+      "approve": true,
+      "matchCommandLine": true
+    },
+    "/^bash -lc \"strings '/Volumes/HD-TOP/Project/Unihiker_10kpro/Unihiker-10k-pro/external_packages/framework-arduinounihiker/tools/sdk/esp32s3/lib/libESP32_IO_Expander\\.a' \\| egrep -i 'XL9535\\|xl9535' > '/Volumes/HD-TOP/Project/Unihiker_10kpro/Unihiker-10k-pro/specs/checkpoints/code/02-edge-connector/artifacts/lib_expander_strings\\.txt' \\|\\| true; ls -la '/Volumes/HD-TOP/Project/Unihiker_10kpro/Unihiker-10k-pro/specs/checkpoints/code/02-edge-connector/artifacts/lib_expander_strings\\.txt'\"$/": {
+      "approve": true,
+      "matchCommandLine": true
+    },
+    "/^bash -lc \"bash '/Volumes/HD-TOP/Project/Unihiker_10kpro/Unihiker-10k-pro/specs/checkpoints/code/02-edge-connector/run_lib_strings\\.sh'\"$/": {
+      "approve": true,
+      "matchCommandLine": true
+    },
+    "/^bash -lc \"nm -A '/Volumes/HD-TOP/Project/Unihiker_10kpro/Unihiker-10k-pro/external_packages/framework-arduinounihiker/tools/sdk/esp32s3/lib/libESP32_IO_Expander\\.a' 2>/dev/null \\| egrep -i 'XL9535\\|xl9535\\|io_expander\\|i2c' \\|\\| true\"$/": {
+      "approve": true,
+      "matchCommandLine": true
+    },
+    "/^bash -lc \"bash '/Volumes/HD-TOP/Project/Unihiker_10kpro/Unihiker-10k-pro/specs/checkpoints/code/11-ai-recognition/checkpoint_11_extract\\.sh'\"$/": {
+      "approve": true,
+      "matchCommandLine": true
+    },
+    "/^bash -lc \"ls -1 external_packages/framework-arduinounihiker/tools/sdk/esp32s3/lib \\| egrep -i 'asr\\|audio\\|wake\\|wakenet\\|wakeword\\|voice\\|speech\\|vad\\|features' \\|\\| true\"$/": {
+      "approve": true,
+      "matchCommandLine": true
+    },
+    "/^bash -lc \"for f in libasr\\.a libDFRobot_ESPASR\\.a libesp_audio_processor\\.a libesp_audio_front_end\\.a libvoice_set_xiaole\\.a libwakenet\\.a libwakeword_model\\.a libunihiker_k10\\.a; do echo '----' \\$f; nm -A '/Volumes/HD-TOP/Project/Unihiker_10kpro/Unihiker-10k-pro/external_packages/framework-arduinounihiker/tools/sdk/esp32s3/lib/'\\$f 2>/dev/null \\| egrep -i 'asr\\|asr_\\|asr\\|wake\\|wakeword\\|wakenet\\|voice\\|speech\\|process\\|audio' \\|\\| true; done\"$/": {
+      "approve": true,
+      "matchCommandLine": true
+    },
+    "/^bash -lc \"for f in libasr\\.a libDFRobot_ESPASR\\.a libesp_audio_processor\\.a libesp_audio_front_end\\.a libvoice_set_xiaole\\.a libwakenet\\.a libwakeword_model\\.a libunihiker_k10\\.a; do echo '----' \\$f; nm -A '/Volumes/HD-TOP/Project/Unihiker_10kpro/Unihiker-10k-pro/external_packages/framework-arduinounihiker/tools/sdk/esp32s3/lib/'\\$f 2>/tmp/nm_err \\|\\| true; tail -n 80 /tmp/nm_err \\| sed -n '1,80p'; done\"$/": {
+      "approve": true,
+      "matchCommandLine": true
+    },
+    "/^python3 -m platformio --version$/": {
+      "approve": true,
+      "matchCommandLine": true
+    },
+    "/^python3 -m pip install --user -U platformio$/": {
+      "approve": true,
+      "matchCommandLine": true
+    },
+    "./unihiker-pro/.venv/bin/python": true,
+    "../../.venv/bin/python": true,
+    "/Volumes/HD-TOP/Project/Unihiker_10kpro/Unihiker-10k-pro/unihiker-pro/.venv/bin/python": true,
+    "strings": true,
+    "true": true,
+    "/^bash -lc 'set -e; FILE=\"\\$HOME/\\.local/bin/platformio\"; mkdir -p \"\\$\\(dirname \"\\$FILE\"\\)\"; if \\[ -f \"\\$FILE\" \\]; then mv \"\\$FILE\" \"\\$\\{FILE\\}\\.bak\\.\\$\\(date \\+%Y%m%d%H%M%S\\)\"; fi; cat > \"\\$FILE\" <<'PYEOF'\n#!/bin/sh\nVENV=\"/Volumes/HD-TOP/Project/Unihiker_10kpro/Unihiker-10k-pro/unihiker-pro/\\.venv\"\nif \\[ -x \"\\$VENV/bin/python\" \\]; then\n  exec \"\\$VENV/bin/python\" -m platformio \"\\$@\"\nelse\n  exec python3 -m platformio \"\\$@\"\nfi\nPYEOF\nchmod \\+x \"\\$FILE\"\n\"\\$FILE\" --version'$/": {
+      "approve": true,
+      "matchCommandLine": true
+    },
+    "/^bash -lc 'ls -l /Volumes/HD-TOP/Project/Unihiker_10kpro/Unihiker-10k-pro/unihiker-pro/\\.venv/bin \\|\\| true; /Volumes/HD-TOP/Project/Unihiker_10kpro/Unihiker-10k-pro/unihiker-pro/\\.venv/bin/python -m platformio --version 2>&1 \\|\\| true'$/": {
+      "approve": true,
+      "matchCommandLine": true
+    },
+    "/^bash -lc 'echo \"Inspecting wrapper\\.\\.\\.\"; head -n 200 \"\\$HOME/\\.local/bin/platformio\" \\|\\| true; echo \"--- which/ls ---\"; which platformio \\|\\| true; ls -l \"\\$HOME/\\.local/bin/platformio\" \\|\\| true'$/": {
+      "approve": true,
+      "matchCommandLine": true
+    },
+    "/^bash -lc 'set -e; FILE=\"\\$HOME/\\.local/bin/platformio\"; printf \"%s\n\" \"#!/bin/sh\" \"VENV=\\\\\"/Volumes/HD-TOP/Project/Unihiker_10kpro/Unihiker-10k-pro/unihiker-pro/\\.venv\\\\\"\" \"if \\[ -x \\\\\"\\\\\\$VENV/bin/python\\\\\" \\]; then\" \"  exec \\\\\"\\\\\\$VENV/bin/python\\\\\" -m platformio \\\\\"\\\\\\$@\\\\\"\" \"else\" \"  exec python3 -m platformio \\\\\"\\\\\\$@\\\\\"\" \"fi\" > \"\\$FILE\"; chmod \\+x \"\\$FILE\"; echo \"Wrote \\$FILE\"; \"\\$FILE\" --version'$/": {
+      "approve": true,
+      "matchCommandLine": true
+    },
+    "/^bash -lc 'pkill -f \"platformio device monitor\" \\|\\| true; /Users/btfshadow/\\.local/bin/platformio device monitor -p /dev/cu\\.usbmodem21201 -b 115200 2>&1 \\| tee /tmp/epin_log\\.txt & MON_PID=\\$!; sleep 8; kill \\$MON_PID >/dev/null 2>&1 \\|\\| true; sleep 1; tail -n 200 /tmp/epin_log\\.txt'$/": {
+      "approve": true,
+      "matchCommandLine": true
     }
   }
 }

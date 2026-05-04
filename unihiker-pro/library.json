@@ -1,0 +1,14 @@
+{
+  "name": "unihiker-pro",
+  "version": "0.1.0",
+  "description": "Layered SDK for UNIHIKER K10 with HAL, services and facade APIs.",
+  "frameworks": "arduino",
+  "platforms": "espressif32",
+  "build": {
+    "flags": [
+      "-Wl,--wrap=init_board",
+      "-Wl,--wrap=digital_write",
+      "-Wl,--wrap=digital_read"
+    ]
+  }
+}
