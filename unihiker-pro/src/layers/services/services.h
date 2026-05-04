@@ -5,6 +5,8 @@
 #include <Arduino.h>
 #include <AIRecognition.h>
 #include <esp_camera.h>
+#include <freertos/FreeRTOS.h>
+#include <freertos/semphr.h>
 #include <unihiker_k10.h>
 
 namespace unihiker_pro {
@@ -12,7 +14,14 @@ namespace unihiker_pro {
 class DisplayService {
  public:
   explicit DisplayService(IBoardHal &hal)
-      : hal_(hal), font_(Canvas::eCNAndENFont24) {}
+      : hal_(hal),
+        font_(Canvas::eCNAndENFont24),
+        canvasMutex_(xSemaphoreCreateRecursiveMutex()),
+        canvasSessionActive_(false),
+        canvasSessionId_(0) {}
+
+  DisplayService(const DisplayService &) = delete;
+  DisplayService &operator=(const DisplayService &) = delete;
 
   // Background / session
   Status setBackground(uint32_t color);
@@ -44,8 +53,14 @@ class DisplayService {
   Status update();
 
  private:
+  Status lockCanvas(Canvas **canvasOut);
+  void unlockCanvas();
+
   IBoardHal &hal_;
   Canvas::eFontSize_t font_;
+  SemaphoreHandle_t canvasMutex_;
+  bool canvasSessionActive_;
+  uint32_t canvasSessionId_;
 };
 
 class InputService {
@@ -120,9 +135,50 @@ class PinService {
   IBoardHal &hal_;
 };
 
+struct SensorCacheConfig {
+  uint32_t environmentMs = 1000;
+  uint32_t ambientMs = 500;
+  uint32_t accelMs = 120;
+  uint32_t micMs = 120;
+};
+
+struct SensorDiagnostics {
+  bool boardReady = false;
+  bool i2cBusReady = false;
+  bool aht20Present = false;
+  bool alsPresent = false;
+  bool accelPresent = false;
+  bool micAvailable = false;
+};
+
 class SensorService {
  public:
-  explicit SensorService(IBoardHal &hal) : hal_(hal) {}
+  explicit SensorService(IBoardHal &hal)
+      : hal_(hal),
+        cacheConfig_(),
+        tempC_(0.0f),
+        humidityRh_(0.0f),
+        ambientLux_(0),
+        accelX_(0),
+        accelY_(0),
+        accelZ_(0),
+        micLevel_(0),
+        envCached_(false),
+        ambientCached_(false),
+        accelCached_(false),
+        micCached_(false),
+        envLastMs_(0),
+        ambientLastMs_(0),
+        accelLastMs_(0),
+        micLastMs_(0) {}
+
+  Status setCacheConfig(const SensorCacheConfig &config);
+  Status refreshEnvironment();
+  Status refreshAmbient();
+  Status refreshMotion();
+  Status refreshMic();
+  Status refreshAll();
+  Status diagnose(SensorDiagnostics &out);
 
   float temperatureC();
   float humidityRh();
@@ -133,7 +189,28 @@ class SensorService {
   uint64_t micLevel();
 
  private:
+  bool cacheExpired(uint32_t nowMs, uint32_t lastMs, uint32_t ttlMs) const;
+
   IBoardHal &hal_;
+  SensorCacheConfig cacheConfig_;
+
+  float tempC_;
+  float humidityRh_;
+  uint16_t ambientLux_;
+  int accelX_;
+  int accelY_;
+  int accelZ_;
+  uint64_t micLevel_;
+
+  bool envCached_;
+  bool ambientCached_;
+  bool accelCached_;
+  bool micCached_;
+
+  uint32_t envLastMs_;
+  uint32_t ambientLastMs_;
+  uint32_t accelLastMs_;
+  uint32_t micLastMs_;
 };
 
 // Callback de progresso: recebe valor 0–100 (porcentagem).

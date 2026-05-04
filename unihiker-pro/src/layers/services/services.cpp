@@ -2,8 +2,11 @@
 
 #include <Arduino.h>
 #include <Preferences.h>
+#include <Wire.h>
 #include <asr.h>
 #include <esp_camera.h>
+#include <freertos/FreeRTOS.h>
+#include <freertos/semphr.h>
 #include <img_converters.h>
 #include <SD.h>
 #include <unihiker_k10.h>
@@ -104,6 +107,18 @@ static String sanitizeFilenameComponent(const String &input) {
   if (out.length() == 0) out = "capture";
   return out;
 }
+
+static const uint8_t kI2cSdaPin = 47;
+static const uint8_t kI2cSclPin = 48;
+static const uint8_t kAht20I2cAddr = 0x38;
+static const uint8_t kAlsI2cAddr = 0x29;
+static const uint8_t kAccelI2cAddr0 = 0x18;
+static const uint8_t kAccelI2cAddr1 = 0x19;
+
+static bool probeI2cAddress(TwoWire &wire, uint8_t addr) {
+  wire.beginTransmission(addr);
+  return wire.endTransmission() == 0;
+}
 }  // namespace
 
 InputService *InputService::activeTimedController_ = nullptr;
@@ -117,19 +132,83 @@ Status DisplayService::setBackground(uint32_t color) {
   return Status::OkStatus();
 }
 
+Status DisplayService::lockCanvas(Canvas **canvasOut) {
+  if (!hal_.isReady()) {
+    return Status::Error(StatusCode::NotInitialized, "board not initialized");
+  }
+  if (!canvasMutex_) {
+    return Status::Error(StatusCode::IOError, "display mutex unavailable");
+  }
+  if (xSemaphoreTakeRecursive(canvasMutex_, pdMS_TO_TICKS(300)) != pdTRUE) {
+    return Status::Error(StatusCode::Busy, "display busy");
+  }
+
+  Canvas *canvas = hal_.board().canvas;
+  // Adopt boot-created canvas only for first session to preserve legacy startup.
+  if (!canvasSessionActive_ && canvas != nullptr && canvasSessionId_ == 0) {
+    canvasSessionActive_ = true;
+    ++canvasSessionId_;
+  }
+  if (!canvasSessionActive_ || canvas == nullptr) {
+    xSemaphoreGiveRecursive(canvasMutex_);
+    return Status::Error(StatusCode::NotInitialized,
+                         "canvas session not initialized");
+  }
+
+  *canvasOut = canvas;
+  return Status::OkStatus();
+}
+
+void DisplayService::unlockCanvas() {
+  if (canvasMutex_) {
+    xSemaphoreGiveRecursive(canvasMutex_);
+  }
+}
+
 Status DisplayService::createCanvas() {
   if (!hal_.isReady()) {
     return Status::Error(StatusCode::NotInitialized, "board not initialized");
   }
-  hal_.board().creatCanvas();
+  if (!canvasMutex_) {
+    return Status::Error(StatusCode::IOError, "display mutex unavailable");
+  }
+  if (xSemaphoreTakeRecursive(canvasMutex_, pdMS_TO_TICKS(300)) != pdTRUE) {
+    return Status::Error(StatusCode::Busy, "display busy");
+  }
+
+  if (hal_.board().canvas == nullptr) {
+    hal_.board().creatCanvas();
+  }
+  if (hal_.board().canvas == nullptr) {
+    xSemaphoreGiveRecursive(canvasMutex_);
+    return Status::Error(StatusCode::IOError, "failed to create canvas");
+  }
+  canvasSessionActive_ = true;
+  ++canvasSessionId_;
+
+  xSemaphoreGiveRecursive(canvasMutex_);
   return Status::OkStatus();
 }
 
 Status DisplayService::destroyCanvas() {
-  if (!hal_.isReady() || hal_.board().canvas == nullptr) {
+  if (!hal_.isReady()) {
     return Status::OkStatus();
   }
-  hal_.board().canvas->canvasClear();
+  if (!canvasMutex_) {
+    return Status::Error(StatusCode::IOError, "display mutex unavailable");
+  }
+  if (xSemaphoreTakeRecursive(canvasMutex_, pdMS_TO_TICKS(300)) != pdTRUE) {
+    return Status::Error(StatusCode::Busy, "display busy");
+  }
+
+  if (hal_.board().canvas != nullptr) {
+    hal_.board().canvas->canvasClear();
+    hal_.board().canvas->updateCanvas();
+  }
+  canvasSessionActive_ = false;
+  ++canvasSessionId_;
+
+  xSemaphoreGiveRecursive(canvasMutex_);
   return Status::OkStatus();
 }
 
@@ -142,34 +221,42 @@ Status DisplayService::setCameraBackground(bool enabled) {
 }
 
 Status DisplayService::clearCanvas() {
-  if (!hal_.isReady() || hal_.board().canvas == nullptr) {
-    return Status::Error(StatusCode::NotInitialized, "canvas not initialized");
-  }
-  hal_.board().canvas->canvasClear();
+  Canvas *canvas = nullptr;
+  Status st = lockCanvas(&canvas);
+  if (!st.ok()) return st;
+
+  canvas->canvasClear();
+  unlockCanvas();
   return Status::OkStatus();
 }
 
 Status DisplayService::clearRow(uint8_t row) {
-  if (!hal_.isReady() || hal_.board().canvas == nullptr) {
-    return Status::Error(StatusCode::NotInitialized, "canvas not initialized");
-  }
-  hal_.board().canvas->canvasClear(row);
+  Canvas *canvas = nullptr;
+  Status st = lockCanvas(&canvas);
+  if (!st.ok()) return st;
+
+  canvas->canvasClear(row);
+  unlockCanvas();
   return Status::OkStatus();
 }
 
 Status DisplayService::clearRegion(uint16_t x, uint16_t y, uint16_t w, uint16_t h) {
-  if (!hal_.isReady() || hal_.board().canvas == nullptr) {
-    return Status::Error(StatusCode::NotInitialized, "canvas not initialized");
-  }
-  hal_.board().canvas->clearLocalCanvas(x, y, w, h);
+  Canvas *canvas = nullptr;
+  Status st = lockCanvas(&canvas);
+  if (!st.ok()) return st;
+
+  canvas->clearLocalCanvas(x, y, w, h);
+  unlockCanvas();
   return Status::OkStatus();
 }
 
 Status DisplayService::setLineWidth(uint8_t w) {
-  if (!hal_.isReady() || hal_.board().canvas == nullptr) {
-    return Status::Error(StatusCode::NotInitialized, "canvas not initialized");
-  }
-  hal_.board().canvas->canvasSetLineWidth(w);
+  Canvas *canvas = nullptr;
+  Status st = lockCanvas(&canvas);
+  if (!st.ok()) return st;
+
+  canvas->canvasSetLineWidth(w);
+  unlockCanvas();
   return Status::OkStatus();
 }
 
@@ -179,78 +266,96 @@ Status DisplayService::setFontSize(Canvas::eFontSize_t font) {
 }
 
 Status DisplayService::drawPoint(int16_t x, int16_t y, uint32_t color) {
-  if (!hal_.isReady() || hal_.board().canvas == nullptr) {
-    return Status::Error(StatusCode::NotInitialized, "canvas not initialized");
-  }
-  hal_.board().canvas->canvasPoint(x, y, color);
+  Canvas *canvas = nullptr;
+  Status st = lockCanvas(&canvas);
+  if (!st.ok()) return st;
+
+  canvas->canvasPoint(x, y, color);
+  unlockCanvas();
   return Status::OkStatus();
 }
 
 Status DisplayService::drawLine(int x1, int y1, int x2, int y2, uint32_t color) {
-  if (!hal_.isReady() || hal_.board().canvas == nullptr) {
-    return Status::Error(StatusCode::NotInitialized, "canvas not initialized");
-  }
-  hal_.board().canvas->canvasLine(x1, y1, x2, y2, color);
+  Canvas *canvas = nullptr;
+  Status st = lockCanvas(&canvas);
+  if (!st.ok()) return st;
+
+  canvas->canvasLine(x1, y1, x2, y2, color);
+  unlockCanvas();
   return Status::OkStatus();
 }
 
 Status DisplayService::drawCircle(int x, int y, int r, uint32_t color,
                                   uint32_t bgColor, bool fill) {
-  if (!hal_.isReady() || hal_.board().canvas == nullptr) {
-    return Status::Error(StatusCode::NotInitialized, "canvas not initialized");
-  }
-  hal_.board().canvas->canvasCircle(x, y, r, color, bgColor, fill);
+  Canvas *canvas = nullptr;
+  Status st = lockCanvas(&canvas);
+  if (!st.ok()) return st;
+
+  canvas->canvasCircle(x, y, r, color, bgColor, fill);
+  unlockCanvas();
   return Status::OkStatus();
 }
 
 Status DisplayService::drawRect(int x, int y, int w, int h, uint32_t color,
                                 uint32_t bgColor, bool fill) {
-  if (!hal_.isReady() || hal_.board().canvas == nullptr) {
-    return Status::Error(StatusCode::NotInitialized, "canvas not initialized");
-  }
-  hal_.board().canvas->canvasRectangle(x, y, w, h, color, bgColor, fill);
+  Canvas *canvas = nullptr;
+  Status st = lockCanvas(&canvas);
+  if (!st.ok()) return st;
+
+  canvas->canvasRectangle(x, y, w, h, color, bgColor, fill);
+  unlockCanvas();
   return Status::OkStatus();
 }
 
 Status DisplayService::drawBitmap(int16_t x, int16_t y, int16_t w, int16_t h,
                                   const uint8_t *bitmap) {
-  if (!hal_.isReady() || hal_.board().canvas == nullptr) {
-    return Status::Error(StatusCode::NotInitialized, "canvas not initialized");
-  }
-  hal_.board().canvas->canvasDrawBitmap(x, y, w, h, bitmap);
+  Canvas *canvas = nullptr;
+  Status st = lockCanvas(&canvas);
+  if (!st.ok()) return st;
+
+  canvas->canvasDrawBitmap(x, y, w, h, bitmap);
+  unlockCanvas();
   return Status::OkStatus();
 }
 
 Status DisplayService::drawImage(int16_t x, int16_t y, const String &path) {
-  if (!hal_.isReady() || hal_.board().canvas == nullptr) {
-    return Status::Error(StatusCode::NotInitialized, "canvas not initialized");
-  }
-  hal_.board().canvas->canvasDrawImage(x, y, path);
+  Canvas *canvas = nullptr;
+  Status st = lockCanvas(&canvas);
+  if (!st.ok()) return st;
+
+  canvas->canvasDrawImage(x, y, path);
+  unlockCanvas();
   return Status::OkStatus();
 }
 
 Status DisplayService::textRow(const String &text, uint8_t row, uint32_t color) {
-  if (!hal_.isReady() || hal_.board().canvas == nullptr) {
-    return Status::Error(StatusCode::NotInitialized, "canvas not initialized");
-  }
-  hal_.board().canvas->canvasText(text, row, color);
+  Canvas *canvas = nullptr;
+  Status st = lockCanvas(&canvas);
+  if (!st.ok()) return st;
+
+  canvas->canvasText(text, row, color);
+  unlockCanvas();
   return Status::OkStatus();
 }
 
 Status DisplayService::textAt(const String &text, int16_t x, int16_t y, uint32_t color,
                               int count, bool autoClean) {
-  if (!hal_.isReady() || hal_.board().canvas == nullptr) {
-    return Status::Error(StatusCode::NotInitialized, "canvas not initialized");
-  }
-  hal_.board().canvas->canvasText(text, x, y, color, font_, count, autoClean);
+  Canvas *canvas = nullptr;
+  Status st = lockCanvas(&canvas);
+  if (!st.ok()) return st;
+
+  canvas->canvasText(text, x, y, color, font_, count, autoClean);
+  unlockCanvas();
   return Status::OkStatus();
 }
 
 Status DisplayService::update() {
-  if (!hal_.isReady() || hal_.board().canvas == nullptr) {
-    return Status::Error(StatusCode::NotInitialized, "canvas not initialized");
-  }
-  hal_.board().canvas->updateCanvas();
+  Canvas *canvas = nullptr;
+  Status st = lockCanvas(&canvas);
+  if (!st.ok()) return st;
+
+  canvas->updateCanvas();
+  unlockCanvas();
   return Status::OkStatus();
 }
 
@@ -426,19 +531,151 @@ Status PinService::write(BoardPin pin, bool level) { return hal_.writePin(pin, l
 
 bool PinService::read(BoardPin pin) { return hal_.readPin(pin); }
 
-float SensorService::temperatureC() { return hal_.aht20().getData(AHT20::eAHT20TempC); }
+bool SensorService::cacheExpired(uint32_t nowMs, uint32_t lastMs,
+                                 uint32_t ttlMs) const {
+  if (ttlMs == 0) return true;
+  return (uint32_t)(nowMs - lastMs) >= ttlMs;
+}
 
-float SensorService::humidityRh() { return hal_.aht20().getData(AHT20::eAHT20HumiRH); }
+Status SensorService::setCacheConfig(const SensorCacheConfig &config) {
+  cacheConfig_ = config;
+  return Status::OkStatus();
+}
 
-uint16_t SensorService::ambientLux() { return hal_.board().readALS(); }
+Status SensorService::refreshEnvironment() {
+  if (!hal_.isReady()) {
+    return Status::Error(StatusCode::NotInitialized, "board not initialized");
+  }
+  tempC_ = hal_.aht20().getData(AHT20::eAHT20TempC);
+  humidityRh_ = hal_.aht20().getData(AHT20::eAHT20HumiRH);
+  envCached_ = true;
+  envLastMs_ = millis();
+  return Status::OkStatus();
+}
 
-int SensorService::accelX() { return hal_.board().getAccelerometerX(); }
+Status SensorService::refreshAmbient() {
+  if (!hal_.isReady()) {
+    return Status::Error(StatusCode::NotInitialized, "board not initialized");
+  }
+  ambientLux_ = hal_.board().readALS();
+  ambientCached_ = true;
+  ambientLastMs_ = millis();
+  return Status::OkStatus();
+}
 
-int SensorService::accelY() { return hal_.board().getAccelerometerY(); }
+Status SensorService::refreshMotion() {
+  if (!hal_.isReady()) {
+    return Status::Error(StatusCode::NotInitialized, "board not initialized");
+  }
+  accelX_ = hal_.board().getAccelerometerX();
+  accelY_ = hal_.board().getAccelerometerY();
+  accelZ_ = hal_.board().getAccelerometerZ();
+  accelCached_ = true;
+  accelLastMs_ = millis();
+  return Status::OkStatus();
+}
 
-int SensorService::accelZ() { return hal_.board().getAccelerometerZ(); }
+Status SensorService::refreshMic() {
+  if (!hal_.isReady()) {
+    return Status::Error(StatusCode::NotInitialized, "board not initialized");
+  }
+  micLevel_ = hal_.board().readMICData();
+  micCached_ = true;
+  micLastMs_ = millis();
+  return Status::OkStatus();
+}
 
-uint64_t SensorService::micLevel() { return hal_.board().readMICData(); }
+Status SensorService::refreshAll() {
+  Status st = refreshEnvironment();
+  if (!st.ok()) return st;
+  st = refreshAmbient();
+  if (!st.ok()) return st;
+  st = refreshMotion();
+  if (!st.ok()) return st;
+  return refreshMic();
+}
+
+Status SensorService::diagnose(SensorDiagnostics &out) {
+  out = SensorDiagnostics();
+  out.boardReady = hal_.isReady();
+  if (!out.boardReady) {
+    return Status::Error(StatusCode::NotInitialized, "board not initialized");
+  }
+
+  Wire.begin(kI2cSdaPin, kI2cSclPin);
+  out.i2cBusReady = true;
+  out.aht20Present = probeI2cAddress(Wire, kAht20I2cAddr);
+  out.alsPresent = probeI2cAddress(Wire, kAlsI2cAddr);
+  out.accelPresent = probeI2cAddress(Wire, kAccelI2cAddr0) ||
+                     probeI2cAddress(Wire, kAccelI2cAddr1);
+  out.micAvailable = true;
+
+  return Status::OkStatus();
+}
+
+float SensorService::temperatureC() {
+  if (!hal_.isReady()) return 0.0f;
+  uint32_t nowMs = millis();
+  if (!envCached_ || cacheExpired(nowMs, envLastMs_, cacheConfig_.environmentMs)) {
+    (void)refreshEnvironment();
+  }
+  return tempC_;
+}
+
+float SensorService::humidityRh() {
+  if (!hal_.isReady()) return 0.0f;
+  uint32_t nowMs = millis();
+  if (!envCached_ || cacheExpired(nowMs, envLastMs_, cacheConfig_.environmentMs)) {
+    (void)refreshEnvironment();
+  }
+  return humidityRh_;
+}
+
+uint16_t SensorService::ambientLux() {
+  if (!hal_.isReady()) return 0;
+  uint32_t nowMs = millis();
+  if (!ambientCached_ ||
+      cacheExpired(nowMs, ambientLastMs_, cacheConfig_.ambientMs)) {
+    (void)refreshAmbient();
+  }
+  return ambientLux_;
+}
+
+int SensorService::accelX() {
+  if (!hal_.isReady()) return 0;
+  uint32_t nowMs = millis();
+  if (!accelCached_ || cacheExpired(nowMs, accelLastMs_, cacheConfig_.accelMs)) {
+    (void)refreshMotion();
+  }
+  return accelX_;
+}
+
+int SensorService::accelY() {
+  if (!hal_.isReady()) return 0;
+  uint32_t nowMs = millis();
+  if (!accelCached_ || cacheExpired(nowMs, accelLastMs_, cacheConfig_.accelMs)) {
+    (void)refreshMotion();
+  }
+  return accelY_;
+}
+
+int SensorService::accelZ() {
+  if (!hal_.isReady()) return 0;
+  uint32_t nowMs = millis();
+  if (!accelCached_ || cacheExpired(nowMs, accelLastMs_, cacheConfig_.accelMs)) {
+    (void)refreshMotion();
+  }
+  return accelZ_;
+}
+
+uint64_t SensorService::micLevel() {
+  if (!hal_.isReady()) return 0;
+  uint32_t nowMs = millis();
+  if (!micCached_ || cacheExpired(nowMs, micLastMs_, cacheConfig_.micMs)) {
+    (void)refreshMic();
+  }
+  return micLevel_;
+}
 
 Status CameraService::start() {
   if (previewInitialized_) {
