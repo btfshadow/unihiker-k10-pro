@@ -17,7 +17,7 @@ UniHikerPro::UniHikerPro()
       pinService_(*boardHalRef_),
       sensorService_(*boardHalRef_),
       storageService_(*boardHalRef_),
-      cameraService_(*boardHalRef_),
+      cameraService_(*boardHalRef_, &inputService_),
       audioService_(*boardHalRef_, *audioHalRef_),
       visionService_(*boardHalRef_, *visionHalRef_),
       speechService_(*speechHalRef_) {}
@@ -38,7 +38,7 @@ UniHikerPro::UniHikerPro(IBoardHal &boardHal, IVisionHal &visionHal,
       pinService_(*boardHalRef_),
       sensorService_(*boardHalRef_),
       storageService_(*boardHalRef_),
-      cameraService_(*boardHalRef_),
+      cameraService_(*boardHalRef_, &inputService_),
       audioService_(*boardHalRef_, *audioHalRef_),
       visionService_(*boardHalRef_, *visionHalRef_),
       speechService_(*speechHalRef_) {}

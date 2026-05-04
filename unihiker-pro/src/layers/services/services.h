@@ -50,6 +50,8 @@ class DisplayService {
 
 class InputService {
  public:
+  static constexpr uint32_t kDefaultLongPressMs = 2000;
+
   explicit InputService(IBoardHal &hal) : hal_(hal) {}
 
   bool buttonAPressed();
@@ -59,8 +61,37 @@ class InputService {
   Status onPress(ButtonId button, ButtonCallback callback);
   Status onRelease(ButtonId button, ButtonCallback callback);
 
+  // Global homogeneous timing controller: action runs on release.
+  // press < longPressMs => shortCallback, press >= longPressMs => longCallback.
+  Status onReleaseByDuration(ButtonId button,
+                             ButtonCallback shortCallback,
+                             ButtonCallback longCallback,
+                             uint32_t longPressMs = kDefaultLongPressMs);
+
  private:
+  struct TimedBinding {
+    bool enabled = false;
+    uint32_t pressedAtMs = 0;
+    uint32_t longPressMs = kDefaultLongPressMs;
+    ButtonCallback shortCallback = nullptr;
+    ButtonCallback longCallback = nullptr;
+  };
+
+  static InputService *activeTimedController_;
+
+  static void onPressAThunk();
+  static void onPressBThunk();
+  static void onPressABThunk();
+  static void onReleaseAThunk();
+  static void onReleaseBThunk();
+  static void onReleaseABThunk();
+
+  void handleTimedPress(ButtonId button);
+  void handleTimedRelease(ButtonId button);
+  uint8_t buttonIndex(ButtonId button) const;
+
   IBoardHal &hal_;
+  TimedBinding timedBindings_[3];
 };
 
 class LedService {
@@ -108,9 +139,54 @@ class SensorService {
 // Callback de progresso: recebe valor 0–100 (porcentagem).
 using ProgressCallback = void (*)(uint8_t percent);
 
+struct CameraLiveOptions {
+  // Optional app callbacks for each button gesture.
+  ButtonCallback onAShort = nullptr;
+  ButtonCallback onALong = nullptr;
+  ButtonCallback onBShort = nullptr;
+  ButtonCallback onBLong = nullptr;
+
+  // Called after default B-long behavior (cameraStop) to return UI/context.
+  ButtonCallback onReturnContext = nullptr;
+
+  // Threshold used by timed release controller.
+  uint32_t longPressMs = InputService::kDefaultLongPressMs;
+};
+
 class CameraService {
  public:
-  explicit CameraService(IBoardHal &hal) : hal_(hal), previewActive_(false) {}
+  explicit CameraService(IBoardHal &hal, InputService *input = nullptr)
+      : hal_(hal),
+        input_(input),
+        previewInitialized_(false),
+        previewActive_(false),
+  liveControllerActive_(false),
+  liveResIndex_(0),
+  livePhotoIndex_(0) {}
+
+  // Simple lifecycle helpers for app-level usage.
+  // start(): starts preview pipeline.
+  // stop(): hides preview (soft stop).
+  // killAndReboot(): hard stop by rebooting MCU.
+  Status start();
+  Status stop();
+  Status killAndReboot(uint16_t delayMs = 120);
+
+  // High-level helper for app usage:
+  // - starts camera preview
+  // - routes A/B short/long on release using configured threshold
+  // - A long default: cameraStop() + onReturnContext callback
+  Status cameraLive(const CameraLiveOptions &options = CameraLiveOptions());
+
+  // Boot helper for reboot-based capture flow.
+  // - CaptureOnce role: captures one frame and reboots back to Live role.
+  // - Live role: enters cameraLive automatically.
+  // - Menu role: does nothing (caller should draw menu).
+  Status cameraLiveBoot(const CameraLiveOptions &options, bool *enteredLive = nullptr);
+
+  // cameraStop() soft-stops preview and clears live controller state.
+  // hardCleanup=true performs reboot-based hard stop.
+  Status cameraStop(bool hardCleanup = false, uint16_t rebootDelayMs = 120);
 
   // Inicia pipeline de câmera e exibe preview no fundo da tela.
   Status initPreview();
@@ -136,8 +212,34 @@ class CameraService {
   Status writeBmpToSd(const String &path, camera_fb_t *fb,
                       ProgressCallback onProgress);
 
+  static CameraService *activeLiveController_;
+  static void onLiveAShortThunk();
+  static void onLiveALongThunk();
+  static void onLiveBShortThunk();
+  static void onLiveBLongThunk();
+  void handleLiveAShort();
+  void handleLiveALong();
+  void handleLiveBShort();
+  void handleLiveBLong();
+  void drawDefaultLiveUi();
+  void cycleDefaultLiveResolution();
+  Status captureDefaultLivePhoto();
+  Status queueDefaultLiveCaptureByReboot();
+  const char *currentLiveResolutionName() const;
+  void loadLiveState();
+  bool saveLiveRole(uint8_t role);
+  bool saveLiveRes();
+  bool saveLivePhoto();
+  uint8_t loadLiveRoleRaw();
+
   IBoardHal &hal_;
+  InputService *input_;
+  bool previewInitialized_;
   bool previewActive_;
+  bool liveControllerActive_;
+  uint8_t liveResIndex_;
+  uint32_t livePhotoIndex_;
+  CameraLiveOptions liveOptions_;
 };
 
 class StorageService {

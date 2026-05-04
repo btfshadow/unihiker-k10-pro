@@ -1,11 +1,111 @@
 #include "services.h"
 
+#include <Arduino.h>
+#include <Preferences.h>
 #include <asr.h>
 #include <esp_camera.h>
+#include <img_converters.h>
 #include <SD.h>
 #include <unihiker_k10.h>
+#include <who_camera.h>
+
+extern "C" void lv_fs_fatfs_init(void);
 
 namespace unihiker_pro {
+
+namespace {
+struct LiveModeItem {
+  framesize_t size;
+  const char *name;
+};
+
+static const LiveModeItem kLiveModes[] = {
+  {FRAMESIZE_SVGA, "SVGA 800x600"},
+  {FRAMESIZE_XGA, "XGA 1024x768"},
+  {FRAMESIZE_SXGA, "SXGA 1280x1024"},
+  {FRAMESIZE_UXGA, "UXGA 1600x1200"},
+};
+
+static const uint8_t kLiveModeCount =
+    (uint8_t)(sizeof(kLiveModes) / sizeof(kLiveModes[0]));
+
+static const char *kLivePrefsNs = "cam_live_core";
+static const char *kLiveRoleKey = "role";
+static const char *kLiveResKey = "res";
+static const char *kLivePhotoKey = "photo";
+static const uint32_t kCaptureBootSettleMs = 1200;
+static const uint32_t kCaptureWarmupMs = 2000;
+
+enum LiveRole : uint8_t {
+  LiveRoleMenu = 0,
+  LiveRoleLive = 1,
+  LiveRoleCaptureOnce = 2,
+};
+
+static bool gLvFsFatFsReady = false;
+static QueueHandle_t gLiveCaptureQueue = nullptr;
+
+static Status ensureSdReadyNoLoop() {
+  if (!SD.begin()) {
+    return Status::Error(StatusCode::IOError, "SD.begin failed");
+  }
+  if (!gLvFsFatFsReady) {
+    lv_fs_fatfs_init();
+    gLvFsFatFsReady = true;
+  }
+  return Status::OkStatus();
+}
+
+static bool prefsBegin(Preferences &prefs, bool readOnly) {
+  return prefs.begin(kLivePrefsNs, readOnly);
+}
+
+static bool initLiveCaptureQueue(framesize_t size) {
+  if (!gLiveCaptureQueue) {
+    gLiveCaptureQueue = xQueueCreate(2, sizeof(camera_fb_t *));
+    if (!gLiveCaptureQueue) return false;
+  }
+  register_camera(PIXFORMAT_RGB565, size, 1, gLiveCaptureQueue);
+  return true;
+}
+
+static void drainLiveCaptureQueue() {
+  if (!gLiveCaptureQueue) return;
+  camera_fb_t *f = nullptr;
+  while (xQueueReceive(gLiveCaptureQueue, &f, 0) == pdTRUE) {
+    if (f) esp_camera_fb_return(f);
+  }
+}
+
+static void warmupLiveCaptureQueue(uint32_t ms) {
+  if (!gLiveCaptureQueue) return;
+  uint32_t end = millis() + ms;
+  while ((int32_t)(end - millis()) > 0) {
+    camera_fb_t *f = nullptr;
+    if (xQueueReceive(gLiveCaptureQueue, &f, pdMS_TO_TICKS(120)) == pdTRUE && f) {
+      esp_camera_fb_return(f);
+    }
+  }
+}
+
+static String sanitizeFilenameComponent(const String &input) {
+  String out;
+  out.reserve(input.length());
+  for (size_t i = 0; i < input.length(); i++) {
+    char c = input[i];
+    bool isAlphaNum = ((c >= 'a' && c <= 'z') ||
+                       (c >= 'A' && c <= 'Z') ||
+                       (c >= '0' && c <= '9'));
+    out += isAlphaNum ? c : '_';
+  }
+  while (out.indexOf("__") >= 0) out.replace("__", "_");
+  if (out.length() == 0) out = "capture";
+  return out;
+}
+}  // namespace
+
+InputService *InputService::activeTimedController_ = nullptr;
+CameraService *CameraService::activeLiveController_ = nullptr;
 
 Status DisplayService::setBackground(uint32_t color) {
   if (!hal_.isReady()) {
@@ -188,6 +288,106 @@ Status InputService::onRelease(ButtonId button, ButtonCallback callback) {
   return hal_.attachButtonRelease(button, callback);
 }
 
+uint8_t InputService::buttonIndex(ButtonId button) const {
+  switch (button) {
+    case ButtonId::A:
+      return 0;
+    case ButtonId::B:
+      return 1;
+    case ButtonId::AB:
+      return 2;
+    default:
+      return 0;
+  }
+}
+
+void InputService::onPressAThunk() {
+  if (activeTimedController_) activeTimedController_->handleTimedPress(ButtonId::A);
+}
+
+void InputService::onPressBThunk() {
+  if (activeTimedController_) activeTimedController_->handleTimedPress(ButtonId::B);
+}
+
+void InputService::onPressABThunk() {
+  if (activeTimedController_) activeTimedController_->handleTimedPress(ButtonId::AB);
+}
+
+void InputService::onReleaseAThunk() {
+  if (activeTimedController_) activeTimedController_->handleTimedRelease(ButtonId::A);
+}
+
+void InputService::onReleaseBThunk() {
+  if (activeTimedController_) activeTimedController_->handleTimedRelease(ButtonId::B);
+}
+
+void InputService::onReleaseABThunk() {
+  if (activeTimedController_) activeTimedController_->handleTimedRelease(ButtonId::AB);
+}
+
+void InputService::handleTimedPress(ButtonId button) {
+  uint8_t idx = buttonIndex(button);
+  if (!timedBindings_[idx].enabled) return;
+  timedBindings_[idx].pressedAtMs = millis();
+}
+
+void InputService::handleTimedRelease(ButtonId button) {
+  uint8_t idx = buttonIndex(button);
+  TimedBinding &binding = timedBindings_[idx];
+  if (!binding.enabled) return;
+
+  uint32_t elapsed = millis() - binding.pressedAtMs;
+  bool isLong = elapsed >= binding.longPressMs;
+  ButtonCallback cb = isLong ? binding.longCallback : binding.shortCallback;
+  if (cb) cb();
+}
+
+Status InputService::onReleaseByDuration(ButtonId button,
+                                         ButtonCallback shortCallback,
+                                         ButtonCallback longCallback,
+                                         uint32_t longPressMs) {
+  if (!hal_.isReady()) {
+    return Status::Error(StatusCode::NotInitialized, "board not initialized");
+  }
+  if (longPressMs == 0) {
+    return Status::Error(StatusCode::InvalidArgument, "longPressMs must be > 0");
+  }
+
+  ButtonCallback pressThunk = nullptr;
+  ButtonCallback releaseThunk = nullptr;
+  switch (button) {
+    case ButtonId::A:
+      pressThunk = &InputService::onPressAThunk;
+      releaseThunk = &InputService::onReleaseAThunk;
+      break;
+    case ButtonId::B:
+      pressThunk = &InputService::onPressBThunk;
+      releaseThunk = &InputService::onReleaseBThunk;
+      break;
+    case ButtonId::AB:
+      pressThunk = &InputService::onPressABThunk;
+      releaseThunk = &InputService::onReleaseABThunk;
+      break;
+    default:
+      return Status::Error(StatusCode::InvalidArgument, "invalid button");
+  }
+
+  activeTimedController_ = this;
+
+  uint8_t idx = buttonIndex(button);
+  timedBindings_[idx].enabled = true;
+  timedBindings_[idx].longPressMs = longPressMs;
+  timedBindings_[idx].shortCallback = shortCallback;
+  timedBindings_[idx].longCallback = longCallback;
+  timedBindings_[idx].pressedAtMs = millis();
+
+  Status s1 = hal_.attachButtonPress(button, pressThunk);
+  if (!s1.ok()) return s1;
+  Status s2 = hal_.attachButtonRelease(button, releaseThunk);
+  if (!s2.ok()) return s2;
+  return Status::OkStatus();
+}
+
 Status LedService::setRgb(int8_t index, const RgbColor &color) {
   if (!hal_.isReady() || hal_.board().rgb == nullptr) {
     return Status::Error(StatusCode::NotInitialized, "rgb not initialized");
@@ -238,12 +438,307 @@ int SensorService::accelZ() { return hal_.board().getAccelerometerZ(); }
 
 uint64_t SensorService::micLevel() { return hal_.board().readMICData(); }
 
+Status CameraService::start() {
+  if (previewInitialized_) {
+    return showPreview(true);
+  }
+  return initPreview();
+}
+
+Status CameraService::stop() {
+  return showPreview(false);
+}
+
+Status CameraService::killAndReboot(uint16_t delayMs) {
+  Status st = showPreview(false);
+  delay(delayMs);
+  ESP.restart();
+  return st;
+}
+
+void CameraService::onLiveAShortThunk() {
+  if (activeLiveController_) activeLiveController_->handleLiveAShort();
+}
+
+void CameraService::onLiveALongThunk() {
+  if (activeLiveController_) activeLiveController_->handleLiveALong();
+}
+
+void CameraService::onLiveBShortThunk() {
+  if (activeLiveController_) activeLiveController_->handleLiveBShort();
+}
+
+void CameraService::onLiveBLongThunk() {
+  if (activeLiveController_) activeLiveController_->handleLiveBLong();
+}
+
+void CameraService::handleLiveAShort() {
+  if (!liveControllerActive_) return;
+  if (liveOptions_.onAShort) {
+    liveOptions_.onAShort();
+    return;
+  }
+
+  cycleDefaultLiveResolution();
+  drawDefaultLiveUi();
+}
+
+void CameraService::handleLiveALong() {
+  if (!liveControllerActive_) return;
+
+  // cameraStop() clears liveOptions_, so snapshot callbacks first.
+  ButtonCallback onReturnContext = liveOptions_.onReturnContext;
+  ButtonCallback onALong = liveOptions_.onALong;
+
+  // Default behavior: long-A leaves live context and stops camera.
+  (void)cameraStop(false);
+
+  if (onReturnContext) onReturnContext();
+  if (onALong) onALong();
+}
+
+void CameraService::handleLiveBShort() {
+  if (!liveControllerActive_) return;
+  if (liveOptions_.onBShort) {
+    liveOptions_.onBShort();
+    return;
+  }
+
+  (void)queueDefaultLiveCaptureByReboot();
+}
+
+void CameraService::handleLiveBLong() {
+  if (!liveControllerActive_) return;
+  ButtonCallback onBLong = liveOptions_.onBLong;
+  if (onBLong) onBLong();
+}
+
+Status CameraService::cameraLive(const CameraLiveOptions &options) {
+  if (!hal_.isReady()) {
+    return Status::Error(StatusCode::NotInitialized, "board not initialized");
+  }
+  if (input_ == nullptr) {
+    return Status::Error(StatusCode::NotSupported,
+                         "cameraLive requires InputService linkage");
+  }
+  if (options.longPressMs == 0) {
+    return Status::Error(StatusCode::InvalidArgument, "longPressMs must be > 0");
+  }
+
+  Status st = start();
+  if (!st.ok()) return st;
+
+  liveOptions_ = options;
+  liveControllerActive_ = true;
+  activeLiveController_ = this;
+
+  loadLiveState();
+  (void)saveLiveRole((uint8_t)LiveRoleLive);
+
+  st = input_->onReleaseByDuration(ButtonId::A,
+                                   &CameraService::onLiveAShortThunk,
+                                   &CameraService::onLiveALongThunk,
+                                   options.longPressMs);
+  if (!st.ok()) return st;
+
+  st = input_->onReleaseByDuration(ButtonId::B,
+                                   &CameraService::onLiveBShortThunk,
+                                   &CameraService::onLiveBLongThunk,
+                                   options.longPressMs);
+  if (!st.ok()) return st;
+
+  drawDefaultLiveUi();
+
+  return Status::OkStatus();
+}
+
+Status CameraService::cameraLiveBoot(const CameraLiveOptions &options, bool *enteredLive) {
+  if (enteredLive) *enteredLive = false;
+  if (!hal_.isReady()) {
+    return Status::Error(StatusCode::NotInitialized, "board not initialized");
+  }
+
+  loadLiveState();
+  const uint8_t role = loadLiveRoleRaw();
+
+  if (role == (uint8_t)LiveRoleCaptureOnce) {
+    // Consume capture role immediately to avoid reboot loops if capture crashes.
+    (void)saveLiveRole((uint8_t)LiveRoleLive);
+
+    // Give camera driver/sensor time to settle after reboot before grabbing frames.
+    delay(kCaptureBootSettleMs);
+
+    Status st = captureDefaultLivePhoto();
+
+    delay(800);
+    ESP.restart();
+    return st;
+  }
+
+  if (role == (uint8_t)LiveRoleLive) {
+    Status st = cameraLive(options);
+    if (st.ok() && enteredLive) *enteredLive = true;
+    return st;
+  }
+
+  return Status::OkStatus();
+}
+
+Status CameraService::cameraStop(bool hardCleanup, uint16_t rebootDelayMs) {
+  liveControllerActive_ = false;
+  liveOptions_ = CameraLiveOptions();
+
+  if (hardCleanup) {
+    return killAndReboot(rebootDelayMs);
+  }
+  return stop();
+}
+
+const char *CameraService::currentLiveResolutionName() const {
+  return kLiveModes[liveResIndex_ % kLiveModeCount].name;
+}
+
+void CameraService::cycleDefaultLiveResolution() {
+  liveResIndex_ = (uint8_t)((liveResIndex_ + 1) % kLiveModeCount);
+  USBSerial.printf("cameraLive default: res -> %s\n", currentLiveResolutionName());
+}
+
+Status CameraService::captureDefaultLivePhoto() {
+  const LiveModeItem &mode = kLiveModes[liveResIndex_ % kLiveModeCount];
+  livePhotoIndex_++;
+
+  String path = "S:/" + sanitizeFilenameComponent(String(mode.name)) +
+                "_" + String(livePhotoIndex_) + ".bmp";
+  String shownPath = path;
+  if (shownPath.startsWith("S:")) shownPath = shownPath.substring(2);
+
+  if (hal_.isReady() && hal_.board().canvas != nullptr) {
+    hal_.board().canvas->canvasClear();
+    hal_.board().canvas->canvasText("capturando...", 1, 0x00FF99);
+    hal_.board().canvas->canvasText(String("res: ") + mode.name,
+                                    8, 52, 0xCFE8FF,
+                                    Canvas::eCNAndENFont16, 28, true);
+    hal_.board().canvas->canvasText(shownPath,
+                                    8, 82, 0xFFFFFF,
+                                    Canvas::eCNAndENFont16, 28, true);
+    hal_.board().canvas->updateCanvas();
+  }
+
+  Status st = captureHiRes(path, mode.size, nullptr);
+  if (st.ok()) {
+    (void)saveLivePhoto();
+    USBSerial.printf("cameraLive default: saved %s\n", path.c_str());
+    if (hal_.isReady() && hal_.board().canvas != nullptr) {
+      hal_.board().canvas->canvasClear();
+      hal_.board().canvas->canvasText("foto salva", 1, 0x00FF99);
+      hal_.board().canvas->canvasText(shownPath,
+                                      8, 52, 0xFFFFFF,
+                                      Canvas::eCNAndENFont16, 28, true);
+      hal_.board().canvas->updateCanvas();
+    }
+  } else {
+    livePhotoIndex_--;
+    USBSerial.printf("cameraLive default: capture error=%d\n", (int)st.code);
+    if (hal_.isReady() && hal_.board().canvas != nullptr) {
+      hal_.board().canvas->canvasClear();
+      hal_.board().canvas->canvasText("erro captura", 1, 0xFF5C5C);
+      hal_.board().canvas->canvasText(String("code: ") + String((int)st.code),
+                                      8, 52, 0xFFFFFF,
+                                      Canvas::eCNAndENFont16, 28, true);
+      hal_.board().canvas->updateCanvas();
+    }
+  }
+  return st;
+}
+
+Status CameraService::queueDefaultLiveCaptureByReboot() {
+  (void)saveLiveRes();
+  (void)saveLivePhoto();
+  (void)saveLiveRole((uint8_t)LiveRoleCaptureOnce);
+  USBSerial.println("cameraLive default: capture armed, rebooting...");
+  delay(150);
+  ESP.restart();
+  return Status::OkStatus();
+}
+
+void CameraService::drawDefaultLiveUi() {
+  if (!hal_.isReady() || hal_.board().canvas == nullptr) {
+    return;
+  }
+  hal_.board().canvas->canvasClear();
+  hal_.board().canvas->canvasText("camera live", 1, 0xFFFFFF);
+  hal_.board().canvas->canvasText(String("res: ") + currentLiveResolutionName(),
+                                  8, 46, 0xCFE8FF,
+                                  Canvas::eCNAndENFont16, 28, true);
+  hal_.board().canvas->canvasText("A<2s:res  B<2s:foto", 8, 78, 0x66CCFF,
+                                  Canvas::eCNAndENFont16, 28, true);
+  hal_.board().canvas->canvasText("A>2s:sair+limpar", 8, 108, 0x66CCFF,
+                                  Canvas::eCNAndENFont16, 28, true);
+  hal_.board().canvas->updateCanvas();
+}
+
+void CameraService::loadLiveState() {
+  Preferences prefs;
+  if (!prefsBegin(prefs, true)) {
+    liveResIndex_ = 0;
+    livePhotoIndex_ = 0;
+    return;
+  }
+
+  uint32_t res = prefs.getUInt(kLiveResKey, 0);
+  uint32_t photo = prefs.getUInt(kLivePhotoKey, 0);
+  prefs.end();
+
+  if (kLiveModeCount == 0) {
+    liveResIndex_ = 0;
+  } else if (res >= kLiveModeCount) {
+    liveResIndex_ = (uint8_t)(kLiveModeCount - 1);
+  } else {
+    liveResIndex_ = (uint8_t)res;
+  }
+  livePhotoIndex_ = photo;
+}
+
+bool CameraService::saveLiveRole(uint8_t role) {
+  Preferences prefs;
+  if (!prefsBegin(prefs, false)) return false;
+  size_t n = prefs.putUInt(kLiveRoleKey, role);
+  prefs.end();
+  return n > 0;
+}
+
+bool CameraService::saveLiveRes() {
+  Preferences prefs;
+  if (!prefsBegin(prefs, false)) return false;
+  size_t n = prefs.putUInt(kLiveResKey, liveResIndex_);
+  prefs.end();
+  return n > 0;
+}
+
+bool CameraService::saveLivePhoto() {
+  Preferences prefs;
+  if (!prefsBegin(prefs, false)) return false;
+  size_t n = prefs.putUInt(kLivePhotoKey, livePhotoIndex_);
+  prefs.end();
+  return n > 0;
+}
+
+uint8_t CameraService::loadLiveRoleRaw() {
+  Preferences prefs;
+  if (!prefsBegin(prefs, true)) return (uint8_t)LiveRoleMenu;
+  uint32_t role = prefs.getUInt(kLiveRoleKey, (uint32_t)LiveRoleMenu);
+  prefs.end();
+  if (role > (uint32_t)LiveRoleCaptureOnce) return (uint8_t)LiveRoleMenu;
+  return (uint8_t)role;
+}
+
 Status CameraService::initPreview() {
   if (!hal_.isReady()) {
     return Status::Error(StatusCode::NotInitialized, "board not initialized");
   }
   hal_.board().initBgCamerImage();
   hal_.board().setBgCamerImage(true);
+  previewInitialized_ = true;
   previewActive_ = true;
   return Status::OkStatus();
 }
@@ -252,6 +747,18 @@ Status CameraService::showPreview(bool enabled) {
   if (!hal_.isReady()) {
     return Status::Error(StatusCode::NotInitialized, "board not initialized");
   }
+
+  // Safe no-op: stopping preview before first init should not crash LVGL internals.
+  if (!previewInitialized_ && !enabled) {
+    previewActive_ = false;
+    return Status::OkStatus();
+  }
+
+  // If preview was never initialized, initialize it on first enable request.
+  if (!previewInitialized_ && enabled) {
+    return initPreview();
+  }
+
   hal_.board().setBgCamerImage(enabled);
   previewActive_ = enabled;
   return Status::OkStatus();
@@ -264,6 +771,12 @@ Status CameraService::capture(const String &path) {
   if (path.isEmpty()) {
     return Status::Error(StatusCode::InvalidArgument, "path is empty");
   }
+
+  Status sdStatus = ensureSdReadyNoLoop();
+  if (!sdStatus.ok()) {
+    return sdStatus;
+  }
+
   hal_.board().photoSaveToTFCard(path);
   return Status::OkStatus();
 }
@@ -277,34 +790,89 @@ Status CameraService::captureHiRes(const String &path, framesize_t framesize,
     return Status::Error(StatusCode::InvalidArgument, "path is empty");
   }
 
-  if (framesize != FRAMESIZE_QVGA) {
-    return Status::Error(
-        StatusCode::NotSupported,
-        "high-res capture is not supported with active SDK preview pipeline");
+  Status sdStatus = ensureSdReadyNoLoop();
+  if (!sdStatus.ok()) {
+    return sdStatus;
+  }
+
+  if (!initLiveCaptureQueue(framesize)) {
+    return Status::Error(StatusCode::IOError, "failed to init capture queue");
   }
 
   if (onProgress) onProgress(0);
-  // Descarta um frame antigo para reduzir ghosting.
-  camera_fb_t *stale = esp_camera_fb_get();
-  if (stale) {
-    esp_camera_fb_return(stale);
+  drainLiveCaptureQueue();
+  warmupLiveCaptureQueue(kCaptureWarmupMs);
+  drainLiveCaptureQueue();
+
+  camera_fb_t *fb = nullptr;
+  for (uint8_t attempt = 0; attempt < 3; attempt++) {
+    drainLiveCaptureQueue();
+    if (xQueueReceive(gLiveCaptureQueue, &fb, pdMS_TO_TICKS(1500)) == pdTRUE && fb) {
+      break;
+    }
+    fb = nullptr;
+    delay(60);
   }
+
+  if (fb == nullptr) {
+    return Status::Error(StatusCode::IOError, "capture timeout");
+  }
+  if (fb->format != PIXFORMAT_RGB565) {
+    esp_camera_fb_return(fb);
+    return Status::Error(StatusCode::NotSupported, "camera format is not RGB565");
+  }
+
+  int32_t w = (int32_t)fb->width;
+  int32_t h = (int32_t)fb->height;
+  if (fb->len != (size_t)w * (size_t)h * 2U) {
+    esp_camera_fb_return(fb);
+    return Status::Error(StatusCode::IOError, "frame length mismatch");
+  }
+
   if (onProgress) onProgress(20);
 
-  // Captura frame no modo atual (QVGA no pipeline legado)
-  camera_fb_t *fb = esp_camera_fb_get();
-  Status result = Status::OkStatus();
-  if (fb == nullptr) {
-    result = Status::Error(StatusCode::IOError, "failed to capture frame");
-  } else {
-    if (onProgress) onProgress(35);
-    result = writeBmpToSd(path, fb, onProgress);
-    esp_camera_fb_return(fb);
+  uint8_t *bmpBuf = nullptr;
+  size_t bmpLen = 0;
+  bool convOk = fmt2bmp(fb->buf, fb->len,
+                        (uint16_t)w, (uint16_t)h,
+                        PIXFORMAT_RGB565,
+                        &bmpBuf, &bmpLen);
+  esp_camera_fb_return(fb);
+
+  if (!convOk || bmpBuf == nullptr || bmpLen == 0) {
+    if (bmpBuf) free(bmpBuf);
+    return Status::Error(StatusCode::IOError, "fmt2bmp conversion failed");
   }
 
-  if (onProgress) onProgress(95);
+  String sdPath = path;
+  if (sdPath.startsWith("S:")) sdPath = sdPath.substring(2);
+
+  if (SD.exists(sdPath.c_str())) SD.remove(sdPath.c_str());
+  File f = SD.open(sdPath.c_str(), FILE_WRITE);
+  if (!f) {
+    free(bmpBuf);
+    return Status::Error(StatusCode::IOError, "failed to open file on SD");
+  }
+
+  if (onProgress) onProgress(35);
+  size_t written = 0;
+  while (written < bmpLen) {
+    size_t n = bmpLen - written;
+    if (n > 4096) n = 4096;
+    if (f.write(bmpBuf + written, n) != n) {
+      f.close();
+      free(bmpBuf);
+      return Status::Error(StatusCode::IOError, "failed to write bmp");
+    }
+    written += n;
+  }
+
+  f.flush();
+  f.close();
+  free(bmpBuf);
+
   if (onProgress) onProgress(100);
-  return result;
+  return Status::OkStatus();
 }
 
 // BMP RGB565 header (66 bytes: 14 file header + 40 DIB + 12 color masks)
@@ -400,13 +968,16 @@ Status StorageService::initSd() {
   if (!hal_.isReady()) {
     return Status::Error(StatusCode::NotInitialized, "board not initialized");
   }
-  hal_.board().initSDFile();
-  return Status::OkStatus();
+  return ensureSdReadyNoLoop();
 }
 
 Status StorageService::savePhotoBmp(const String &path) {
   if (!hal_.isReady()) {
     return Status::Error(StatusCode::NotInitialized, "board not initialized");
+  }
+  Status sdStatus = ensureSdReadyNoLoop();
+  if (!sdStatus.ok()) {
+    return sdStatus;
   }
   hal_.board().photoSaveToTFCard(path);
   return Status::OkStatus();
