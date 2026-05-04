@@ -40,6 +40,8 @@ struct DecodeMode {
 };
 
 static const CaptureMode kCaptureModes[] = {
+  {FRAMESIZE_QVGA, "QVGA 320x240"},
+  {FRAMESIZE_VGA, "VGA 640x480"},
   {FRAMESIZE_SVGA, "SVGA 800x600"},
   {FRAMESIZE_XGA, "XGA 1024x768"},
   {FRAMESIZE_SXGA, "SXGA 1280x1024"},
