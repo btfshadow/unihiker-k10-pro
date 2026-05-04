@@ -3,7 +3,7 @@
 #include <esp_camera.h>
 #include <string.h>
 #include <img_converters.h>
-#include <Preferences.h>
+#include <who_camera.h>
 #include <unihiker_pro.h>
 
 using namespace unihiker_pro;
@@ -13,6 +13,7 @@ UniHikerPro board;
 static bool g_busy = false;
 static bool g_cameraInited = false;
 static bool g_sdReady = false;
+static QueueHandle_t g_frameQueue = nullptr;
 static int g_photoIndex = 0;
 static uint8_t g_resIndex = 0;
 
@@ -99,7 +100,7 @@ static const camera_config_t kCamCfgBase = {
     .grab_mode = CAMERA_GRAB_LATEST,
 };
 
-
+  static void drainFrameQueue();
 
 static void drawProgress(uint8_t pct, const String &label) {
   const int16_t x = 10;
@@ -169,23 +170,17 @@ static String buildCapturePath(const CaptureMode &mode, const DecodeMode &decode
   return String("/") + modeTag + "_" + decodeTag + "_" + sizeTag + "_" + String(photoIndex) + ".bmp";
 }
 
-static bool cameraInit(uint8_t resIdx) {
-  if (!g_cameraInited) {
-    // Init with the exact resolution we need. DMA descriptors are sized per
-    // frame_size at init time — set_framesize() alone corrupts the buffer
-    // layout (wrong DMA node stride). Full reinit is required per resolution.
-    camera_config_t cfg = kCamCfgBase;
-    cfg.frame_size = kModes[resIdx].size;
+static bool initCameraOnce() {
+  if (g_cameraInited) return true;
 
-    esp_err_t err = esp_camera_init(&cfg);
-    if (err != ESP_OK) {
-      USBSerial.printf("camera init failed: 0x%x\n", err);
-      return false;
-    }
-    g_cameraInited = true;
+  if (g_frameQueue == nullptr) {
+    g_frameQueue = xQueueCreate(2, sizeof(camera_fb_t *));
+    if (g_frameQueue == nullptr) return false;
   }
 
-  USBSerial.printf("camera ready: %s\n", kModes[resIdx].name);
+  register_camera(PIXFORMAT_RGB565, kModes[g_resIndex].size, 1, g_frameQueue);
+
+  g_cameraInited = true;
   return true;
 }
 
@@ -239,7 +234,7 @@ static bool saveBmp(const char *path, camera_fb_t *fb) {
   // Peak PSRAM = camera_frame (held) + bmpBuf output only.
   int32_t w = (int32_t)fb->width;
   int32_t h = (int32_t)fb->height;
-  size_t srcLen = (size_t)fb->len;  // pass full allocated buffer size to fmt2bmp
+  size_t srcLen = (size_t)fb->len;
 
   const DecodeMode &decode = kDecodeModes[g_decodeModeIndex];
   if (decode.colorMode != ColorMode::Rgb565) {
@@ -301,28 +296,46 @@ static bool saveBmp(const char *path, camera_fb_t *fb) {
 }
 
 static camera_fb_t *captureFrameWithRetry(const char *modeName, uint8_t retries) {
-  if (!g_cameraInited) return nullptr;
-
-  // Discard warmup frames so exposure/AWB settle
-  for (uint8_t w = 0; w < 3; w++) {
-    camera_fb_t *warm = esp_camera_fb_get();
-    if (warm) esp_camera_fb_return(warm);
-    delay(30);
-  }
+  if (g_frameQueue == nullptr) return nullptr;
 
   for (uint8_t a = 0; a < retries; a++) {
-    camera_fb_t *fb = esp_camera_fb_get();
-    if (fb != nullptr) {
-      USBSerial.printf("capture ok attempt=%u mode=%s frame=%ux%u len=%u fmt=%d\n",
-                       (unsigned)(a + 1), modeName,
-                       (unsigned)fb->width, (unsigned)fb->height,
-                       (unsigned)fb->len, (int)fb->format);
+    camera_fb_t *stale = nullptr;
+    while (xQueueReceive(g_frameQueue, &stale, 0) == pdTRUE) {
+      if (stale != nullptr) {
+        esp_camera_fb_return(stale);
+      }
+    }
+
+    camera_fb_t *fb = nullptr;
+    if (xQueueReceive(g_frameQueue, &fb, pdMS_TO_TICKS(1200)) == pdTRUE && fb != nullptr) {
+      USBSerial.printf("queue capture ok attempt=%u mode=%s frame=%ux%u len=%u fmt=%d\n",
+                       (unsigned)(a + 1),
+                       modeName,
+                       (unsigned)fb->width,
+                       (unsigned)fb->height,
+                       (unsigned)fb->len,
+                       (int)fb->format);
       return fb;
     }
-    USBSerial.printf("capture failed attempt=%u mode=%s\n", (unsigned)(a + 1), modeName);
+
+    USBSerial.printf("queue capture timeout attempt=%u mode=%s\n",
+                     (unsigned)(a + 1),
+                     modeName);
     delay(60);
   }
+
   return nullptr;
+}
+
+static void drainFrameQueue() {
+  if (g_frameQueue == nullptr) return;
+
+  camera_fb_t *stale = nullptr;
+  while (xQueueReceive(g_frameQueue, &stale, 0) == pdTRUE) {
+    if (stale != nullptr) {
+      esp_camera_fb_return(stale);
+    }
+  }
 }
 
 static bool captureToSd(const CaptureMode &mode, String &outPath, String &errMsg) {
@@ -330,13 +343,16 @@ static bool captureToSd(const CaptureMode &mode, String &outPath, String &errMsg
     errMsg = "SD not ready";
     return false;
   }
-  if (!g_cameraInited) {
-    errMsg = "camera not ready";
+  if (!initCameraOnce()) {
+    errMsg = "camera init failed";
     return false;
   }
 
   g_busy = true;
-  drawProgress(0, "Capturing...");
+  drawProgress(0, "Queue capture...");
+  drainFrameQueue();
+
+  drawProgress(15, "Warmup...");
   drawProgress(30, "Waiting frame...");
   camera_fb_t *fb = captureFrameWithRetry(mode.name, 3);
   if (!fb) {
@@ -366,7 +382,7 @@ static bool captureToSd(const CaptureMode &mode, String &outPath, String &errMsg
     size_t len = (size_t)fb->len;
     size_t expectedLen = (size_t)w * (size_t)h * 2U;
 
-    if (w <= 0 || h <= 0 || len < expectedLen) {
+    if (w <= 0 || h <= 0 || len != expectedLen) {
       errMsg = "invalid frame geometry/len";
       USBSerial.printf("frame mismatch: w=%d h=%d len=%u expected=%u\n",
                        (int)w, (int)h, (unsigned)len, (unsigned)expectedLen);
@@ -393,6 +409,62 @@ static bool captureToSd(const CaptureMode &mode, String &outPath, String &errMsg
   return ok;
 }
 
+static void drawResolutionMenu() {
+  board.display().setBackground(0x1A1A1A);
+  board.display().clearCanvas();
+  board.display().textRow("SELECT RESOLUTION", 1, 0xFFFFFF);
+  
+  // Show 3 resolutions at a time, centered on current selection
+  int startIdx = (g_resIndex > 0) ? g_resIndex - 1 : 0;
+  int endIdx = startIdx + 3;
+  if (endIdx > (sizeof(kModes) / sizeof(kModes[0]))) {
+    endIdx = sizeof(kModes) / sizeof(kModes[0]);
+    startIdx = endIdx - 3;
+    if (startIdx < 0) startIdx = 0;
+  }
+  
+  int yPos = 50;
+  for (int i = startIdx; i < endIdx && i < (sizeof(kModes) / sizeof(kModes[0])); i++) {
+    uint16_t color = (i == g_resIndex) ? 0x00FF66 : 0xAAAAAA;
+    const char *marker = (i == g_resIndex) ? "> " : "  ";
+    String line = String(marker) + kModes[i].name;
+    board.display().textAt(line, 15, yPos, color, 24, true);
+    yPos += 35;
+  }
+  
+  board.display().textAt("A: prev  B: select", 10, 176, 0x66CCFF, 20, true);
+  board.display().update();
+}
+
+static void bootResolutionSelector() {
+  // Menu to select resolution before camera init
+  g_resIndex = 1;  // Default to HVGA
+  bool selected = false;
+  unsigned long timeout = millis() + 30000;  // 30 second timeout
+  
+  drawResolutionMenu();
+  
+  while (!selected && millis() < timeout) {
+    if (board.input().pressed(ButtonId::A)) {
+      g_resIndex = (g_resIndex > 0) ? g_resIndex - 1 : (sizeof(kModes) / sizeof(kModes[0])) - 1;
+      drawResolutionMenu();
+      delay(300);
+    }
+    if (board.input().pressed(ButtonId::B)) {
+      selected = true;
+      drawResolutionMenu();
+      delay(100);
+    }
+    delay(50);
+  }
+  
+  board.display().clearCanvas();
+  board.display().textAt(String("Init: ") + kModes[g_resIndex].name, 10, 40, 0x00FF66, 26, true);
+  board.display().textAt("Initializing camera...", 10, 100, 0xFFFFFF, 24, true);
+  board.display().update();
+  delay(500);
+}
+
 static void drawIdleUi() {
   board.display().setBackground(0x1A1A1A);
   board.display().clearCanvas();
@@ -400,31 +472,14 @@ static void drawIdleUi() {
   board.display().textAt(String("Res: ") + kModes[g_resIndex].name, 10, 62, 0xFFFFFF, 29, true);
   board.display().textAt(String("Decode: ") + kDecodeModes[g_decodeModeIndex].name,
                          10, 92, 0xFFFFFF, 28, true);
-  board.display().textAt("A: cycle res+reboot", 10, 132, 0x66CCFF, 24, true);
+  board.display().textAt("A: info", 10, 132, 0x66CCFF, 24, true);
   board.display().textAt("B: capture", 10, 180, 0x66CCFF, 20, true);
   board.display().update();
 }
 
 void onButtonA() {
   if (g_busy) return;
-
-  uint8_t nextIdx = (g_resIndex + 1) % (sizeof(kModes) / sizeof(kModes[0]));
-  USBSerial.printf("A: selecting %s, rebooting...\n", kModes[nextIdx].name);
-
-  board.display().clearCanvas();
-  board.display().textAt("Switching to:", 10, 40, 0xFFFFFF, 24, true);
-  board.display().textAt(kModes[nextIdx].name, 10, 80, 0x00FF66, 28, true);
-  board.display().textAt("Rebooting...", 10, 130, 0xFFD080, 26, true);
-  board.display().update();
-  delay(600);
-
-  // Persist new index so boot reads it after restart
-  Preferences prefs;
-  prefs.begin("cam", false);
-  prefs.putUChar("resIdx", nextIdx);
-  prefs.end();
-
-  ESP.restart();
+  USBSerial.printf("camera locked: %s (dynamic switching causes crashes)\n", kModes[g_resIndex].name);
 }
 
 void onButtonB() {
@@ -477,15 +532,9 @@ void setup() {
   board.led().off();
   board.pins().write(BoardPin::LcdBacklight, true);
 
-  // Read persisted resolution index (default HVGA=1)
-  Preferences prefs;
-  prefs.begin("cam", true);
-  g_resIndex = prefs.getUChar("resIdx", 1);
-  prefs.end();
-  if (g_resIndex >= sizeof(kModes) / sizeof(kModes[0])) g_resIndex = 1;
-
-  cameraInit(g_resIndex);
-
+  // Show resolution selector menu at boot
+  bootResolutionSelector();
+  
   drawIdleUi();
 
   board.input().onPress(ButtonId::A, onButtonA);
@@ -495,5 +544,8 @@ void setup() {
 }
 
 void loop() {
+  if (!g_busy) {
+    drainFrameQueue();
+  }
   delay(50);
 }
