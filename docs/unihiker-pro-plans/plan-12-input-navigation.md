@@ -3,6 +3,10 @@
 ## Objetivo
 Criar um plano dedicado para comportamento de botoes A/B/AB e navegacao entre telas, com contrato unico de gestos e baixo indice de evento perdido/duplicado.
 
+## Status
+- Nao executado.
+- Fila ativa: terceiro plano da sequencia atual.
+
 ## Escopo
 - Gestos de botoes: press, release, short, long e chord AB.
 - Priorizacao de eventos quando houver conflito A/B/AB.

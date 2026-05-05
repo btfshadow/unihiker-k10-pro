@@ -21,6 +21,7 @@ Este diretório consolida as especificações técnicas do SDK original do UNIHI
 - `spec-09-speech-asr-tts.md`
 - `spec-10-connectivity-and-web.md`
 - `spec-11-public-api-compatibility.md`
+- `spec-12-speech-ptbr-artifacts.md`
 
 ## Objetivo
 Documentar o estado atual com precisão e preparar uma migração segura para uma arquitetura multi-camadas, mantendo compatibilidade prática com os drivers originais e APIs mais usadas.

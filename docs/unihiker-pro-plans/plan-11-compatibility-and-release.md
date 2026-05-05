@@ -3,6 +3,10 @@
 ## Objetivo
 Publicar `unihiker-pro` com migração assistida para usuários do SDK antigo.
 
+## Status
+- Nao executado.
+- Fila ativa: segundo plano da sequencia atual.
+
 ## Entregas
 - Camada de compatibilidade
 - Guia de migração por feature

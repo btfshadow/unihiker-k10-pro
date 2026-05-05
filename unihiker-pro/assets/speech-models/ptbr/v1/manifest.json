@@ -1,0 +1,21 @@
+{
+  "model_id": "ptbr-v1",
+  "asr_language": "pt-BR",
+  "wake_words": [
+    "ola luci"
+  ],
+  "commands_profile": "basic-ptbr",
+  "flash_offsets": {
+    "model": "0x510000",
+    "voice_data": "0x985000"
+  },
+  "artifacts": {
+    "model": "srmodels_ptbr.bin",
+    "voice_data": "tts_voice_ptbr.dat"
+  },
+  "checksums": {
+    "model": "",
+    "voice_data": ""
+  },
+  "notes": "Place PTBR artifacts in this folder. Keep checksums updated before release."
+}

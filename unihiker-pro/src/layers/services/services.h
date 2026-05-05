@@ -239,6 +239,18 @@ struct StorageHealth {
   uint64_t usedBytes = 0;
 };
 
+enum class SpeechProfile {
+  Auto = 0,
+  Chinese,
+  English,
+  PortugueseBrazil,
+};
+
+struct SpeechCommandEntry {
+  uint8_t id;
+  String phrase;
+};
+
 enum class VisionWorkflowMode : uint8_t {
   LiveAim = 0,
   CaptureReview,
@@ -624,12 +636,62 @@ class SpeechService {
   explicit SpeechService(ISpeechHal &speechHal) : speechHal_(speechHal) {}
 
   void begin(uint8_t mode = 0, uint8_t lang = 0, uint16_t wakeUpMs = 6000);
+  Status beginWithProfile(SpeechProfile profile,
+                          uint8_t mode = 0,
+                          uint16_t wakeUpMs = 6000,
+                          bool allowFallbackToEnglish = true);
+  Status beginAuto(uint8_t mode = 0,
+                   uint16_t wakeUpMs = 6000,
+                   bool allowFallbackToEnglish = true);
+
+  Status initTts(uint8_t speed = 2);
+
   void addCommand(uint8_t id, const String &phrase);
+  Status resetCommandRegistry();
+  Status queueCommand(uint8_t id, const String &phrase);
+  Status applyQueuedCommands();
+  size_t queuedCommandCount() const { return queuedCommandCount_; }
+
   bool detectCommand(uint8_t id);
+  bool wakeDetected();
+  bool ttsReady() const;
   void speak(const String &text);
 
+  bool initialized() const { return initialized_; }
+  SpeechProfile requestedProfile() const { return requestedProfile_; }
+  SpeechProfile activeProfile() const { return activeProfile_; }
+  uint8_t activeLang() const { return activeLang_; }
+  uint8_t activeMode() const { return activeMode_; }
+  uint16_t activeWakeUpMs() const { return activeWakeUpMs_; }
+  bool fallbackToEnglishApplied() const { return fallbackToEnglishApplied_; }
+  Status lastInitStatus() const { return lastInitStatus_; }
+  String initSummary() const;
+
+  static const char *profileLabel(SpeechProfile profile);
+
  private:
+  Status beginInternal(SpeechProfile requested,
+                       uint8_t mode,
+                       uint8_t lang,
+                       uint16_t wakeUpMs,
+                       bool fallbackApplied,
+                       const char *statusMessage,
+                       bool emitProfileTelemetry);
+
   ISpeechHal &speechHal_;
+  SpeechProfile requestedProfile_ = SpeechProfile::Auto;
+  SpeechProfile activeProfile_ = SpeechProfile::Auto;
+  uint8_t activeLang_ = 0;
+  uint8_t activeMode_ = 0;
+  uint16_t activeWakeUpMs_ = 6000;
+  static constexpr size_t kMaxQueuedCommands = 24;
+  SpeechCommandEntry queuedCommands_[kMaxQueuedCommands];
+  size_t queuedCommandCount_ = 0;
+  bool ttsInitAttempted_ = false;
+  bool initialized_ = false;
+  bool fallbackToEnglishApplied_ = false;
+  Status lastInitStatus_ = Status::Error(StatusCode::NotInitialized,
+                                         "speech not initialized");
 };
 
 }  // namespace unihiker_pro

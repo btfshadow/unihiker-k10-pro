@@ -15,3 +15,12 @@ Padronizar reconhecimento e síntese com fila e prioridades.
 
 ## Validação
 - Reconhecimento de comandos e resposta por TTS
+
+## Status
+- Próximo passo ativo.
+- Foco imediato: Fase 1 (inicialização ASR/TTS) com smoke dedicado para validação em hardware.
+
+## Progresso desta implementação
+- Criado smoke dedicado em `unihiker-pro/tests/speech_smoke` para validar inicialização ASR/TTS no hardware.
+- Smoke registra dois comandos ASR (`hello unihiker`, `status unihiker`) e valida resposta por TTS.
+- Build validado no ambiente `unihiker_k10_smoke`.

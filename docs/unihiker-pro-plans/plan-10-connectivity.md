@@ -3,6 +3,10 @@
 ## Objetivo
 Adicionar conectividade como módulo opcional, independente do core.
 
+## Status
+- Nao executado.
+- Fila ativa: proximo plano de implementacao apos fechamento do TODO de treino PTBR/TTS.
+
 ## Entregas
 - Connectivity service (Wi-Fi status/connect/disconnect)
 - Hooks para mDNS e HTTP

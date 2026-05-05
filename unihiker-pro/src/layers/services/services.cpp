@@ -19,6 +19,13 @@ extern SemaphoreHandle_t xSPIlMutex __attribute__((weak));
 namespace unihiker_pro {
 
 namespace {
+#ifndef UNIHIKER_PRO_SPEECH_MODEL
+#define UNIHIKER_PRO_SPEECH_MODEL "AUTO"
+#endif
+
+#define UP_STR_IMPL(x) #x
+#define UP_STR(x) UP_STR_IMPL(x)
+
 struct LiveModeItem {
   framesize_t size;
   const char *name;
@@ -215,6 +222,35 @@ static const char *aiModeLabel(AiMode mode) {
     default:
       return "none";
   }
+}
+
+static bool speechModelTagEquals(const String &left, const char *right) {
+  String normalized = left;
+  normalized.trim();
+  normalized.replace("\"", "");
+  normalized.toUpperCase();
+  String rhs = right;
+  rhs.toUpperCase();
+  return normalized == rhs;
+}
+
+static String buildSpeechModelTag() {
+  String tag = String(UP_STR(UNIHIKER_PRO_SPEECH_MODEL));
+  tag.replace("\"", "");
+  tag.trim();
+  return tag;
+}
+
+static SpeechProfile profileFromBuildModelTag() {
+  String modelTag = buildSpeechModelTag();
+  if (speechModelTagEquals(modelTag, "CN")) return SpeechProfile::Chinese;
+  if (speechModelTagEquals(modelTag, "EN")) return SpeechProfile::English;
+  if (speechModelTagEquals(modelTag, "PTBR")) return SpeechProfile::PortugueseBrazil;
+  return SpeechProfile::Auto;
+}
+
+static uint8_t langFromProfile(SpeechProfile profile) {
+  return profile == SpeechProfile::Chinese ? 0 : 1;
 }
 
 static Status copyApiFile(const String &srcApiPath,
@@ -3393,15 +3429,249 @@ void VisionService::setWorkflowResult(bool ok,
 }
 
 void SpeechService::begin(uint8_t mode, uint8_t lang, uint16_t wakeUpMs) {
-  speechHal_.asr().asrInit(mode, lang, wakeUpMs);
+  SpeechProfile requested = lang == 0 ? SpeechProfile::Chinese : SpeechProfile::English;
+  beginInternal(requested,
+                mode,
+                lang,
+                wakeUpMs,
+                false,
+                "initialized",
+                false);
+}
+
+Status SpeechService::beginWithProfile(SpeechProfile profile,
+                                       uint8_t mode,
+                                       uint16_t wakeUpMs,
+                                       bool allowFallbackToEnglish) {
+  SpeechProfile requested = profile;
+  if (requested == SpeechProfile::Auto) {
+    requested = profileFromBuildModelTag();
+    if (requested == SpeechProfile::Auto) {
+      requested = SpeechProfile::English;
+    }
+  }
+
+  SpeechProfile effective = requested;
+  bool fallbackApplied = false;
+  const bool buildHasPtbrModel = speechModelTagEquals(buildSpeechModelTag(), "PTBR");
+
+#ifdef UNIHIKER_PRO_SPEECH_MODEL_FALLBACK_EN
+  if (!allowFallbackToEnglish && effective != SpeechProfile::English) {
+    requestedProfile_ = requested;
+    activeProfile_ = SpeechProfile::Auto;
+    initialized_ = false;
+    fallbackToEnglishApplied_ = false;
+    lastInitStatus_ = Status::Error(StatusCode::NotSupported,
+                                    "fallback_en disabled by policy");
+    USBSerial.printf("speech.init fail requested=%s reason=%s model=%s\n",
+                     profileLabel(requested),
+                     lastInitStatus_.message,
+                     buildSpeechModelTag().c_str());
+    return lastInitStatus_;
+  }
+
+  if (effective != SpeechProfile::English) {
+    fallbackApplied = true;
+  }
+  effective = SpeechProfile::English;
+#endif
+
+  if (effective == SpeechProfile::PortugueseBrazil && !buildHasPtbrModel) {
+    if (!allowFallbackToEnglish) {
+      requestedProfile_ = requested;
+      activeProfile_ = SpeechProfile::Auto;
+      initialized_ = false;
+      fallbackToEnglishApplied_ = false;
+      lastInitStatus_ = Status::Error(StatusCode::NotSupported,
+                                      "ptbr model not available in firmware");
+      USBSerial.printf("speech.init fail requested=%s reason=%s model=%s\n",
+                       profileLabel(requested),
+                       lastInitStatus_.message,
+                       buildSpeechModelTag().c_str());
+      return lastInitStatus_;
+    }
+    fallbackApplied = true;
+    effective = SpeechProfile::English;
+  }
+
+  const uint8_t lang = langFromProfile(effective);
+  const char *statusMessage = "initialized";
+  if (fallbackApplied) {
+    statusMessage = "initialized with fallback_en";
+  } else if (effective == SpeechProfile::PortugueseBrazil) {
+    statusMessage = "initialized with ptbr model";
+  }
+
+  return beginInternal(requested,
+                       mode,
+                       lang,
+                       wakeUpMs,
+                       fallbackApplied,
+                       statusMessage,
+                       true);
+}
+
+Status SpeechService::beginAuto(uint8_t mode,
+                                uint16_t wakeUpMs,
+                                bool allowFallbackToEnglish) {
+  return beginWithProfile(SpeechProfile::Auto,
+                          mode,
+                          wakeUpMs,
+                          allowFallbackToEnglish);
+}
+
+Status SpeechService::initTts(uint8_t speed) {
+  if (!initialized_) {
+    return Status::Error(StatusCode::NotInitialized, "speech not initialized");
+  }
+
+  if (speed > 5) {
+    speed = 5;
+  }
+
+  ASR &asr = speechHal_.asr();
+  asr.setAsrSpeed(speed);
+  ttsInitAttempted_ = true;
+
+  if (asr.xQueueTTS == nullptr) {
+    return Status::Error(StatusCode::NotSupported, "tts queue unavailable");
+  }
+  return Status::OkStatus();
 }
 
 void SpeechService::addCommand(uint8_t id, const String &phrase) {
-  speechHal_.asr().addASRCommand(id, phrase);
+  // Avoid broken ASR String overload in current framework package (recursive call).
+  // Route command registration through char* overload explicitly.
+  speechHal_.asr().addASRCommand(id, const_cast<char *>(phrase.c_str()));
+}
+
+Status SpeechService::resetCommandRegistry() {
+  queuedCommandCount_ = 0;
+  return Status::OkStatus();
+}
+
+Status SpeechService::queueCommand(uint8_t id, const String &phrase) {
+  if (phrase.length() == 0) {
+    return Status::Error(StatusCode::InvalidArgument, "empty command phrase");
+  }
+
+  if (queuedCommandCount_ >= kMaxQueuedCommands) {
+    return Status::Error(StatusCode::Busy, "speech command registry full");
+  }
+
+  queuedCommands_[queuedCommandCount_].id = id;
+  queuedCommands_[queuedCommandCount_].phrase = phrase;
+  queuedCommandCount_++;
+  return Status::OkStatus();
+}
+
+Status SpeechService::applyQueuedCommands() {
+  if (!initialized_) {
+    return Status::Error(StatusCode::NotInitialized, "speech not initialized");
+  }
+
+  for (size_t i = 0; i < queuedCommandCount_; ++i) {
+    addCommand(queuedCommands_[i].id, queuedCommands_[i].phrase);
+  }
+
+  return Status::OkStatus();
 }
 
 bool SpeechService::detectCommand(uint8_t id) { return speechHal_.asr().isDetectCmdID(id); }
 
-void SpeechService::speak(const String &text) { speechHal_.asr().speak(text); }
+bool SpeechService::wakeDetected() { return speechHal_.asr().isWakeUp(); }
+
+bool SpeechService::ttsReady() const { return speechHal_.asr().xQueueTTS != nullptr; }
+
+void SpeechService::speak(const String &text) {
+  ASR &asr = speechHal_.asr();
+  if (asr.xQueueTTS == nullptr) {
+    if (!ttsInitAttempted_) {
+      initTts(2);
+    }
+    if (asr.xQueueTTS == nullptr) {
+      USBSerial.println("speech.speak skipped: TTS queue not initialized");
+      return;
+    }
+  }
+  asr.speak(text);
+}
+
+String SpeechService::initSummary() const {
+  String summary = "requested=";
+  summary += profileLabel(requestedProfile_);
+  summary += "; active=";
+  summary += profileLabel(activeProfile_);
+  summary += "; lang=";
+  summary += String((unsigned long)activeLang_);
+  summary += "; mode=";
+  summary += String((unsigned long)activeMode_);
+  summary += "; wakeMs=";
+  summary += String((unsigned long)activeWakeUpMs_);
+  summary += "; fallback_en=";
+  summary += fallbackToEnglishApplied_ ? "yes" : "no";
+  summary += "; model=";
+  summary += buildSpeechModelTag();
+  summary += "; status=";
+  summary += lastInitStatus_.message ? lastInitStatus_.message : "unknown";
+  return summary;
+}
+
+const char *SpeechService::profileLabel(SpeechProfile profile) {
+  switch (profile) {
+    case SpeechProfile::Chinese:
+      return "CN";
+    case SpeechProfile::English:
+      return "EN";
+    case SpeechProfile::PortugueseBrazil:
+      return "PTBR";
+    case SpeechProfile::Auto:
+    default:
+      return "AUTO";
+  }
+}
+
+Status SpeechService::beginInternal(SpeechProfile requested,
+                                    uint8_t mode,
+                                    uint8_t lang,
+                                    uint16_t wakeUpMs,
+                                    bool fallbackApplied,
+                                    const char *statusMessage,
+                                    bool emitProfileTelemetry) {
+  requestedProfile_ = requested;
+  if (requested == SpeechProfile::PortugueseBrazil && !fallbackApplied) {
+    activeProfile_ = SpeechProfile::PortugueseBrazil;
+  } else {
+    activeProfile_ = lang == 0 ? SpeechProfile::Chinese : SpeechProfile::English;
+  }
+  activeLang_ = lang;
+  activeMode_ = mode;
+  activeWakeUpMs_ = wakeUpMs;
+  ttsInitAttempted_ = false;
+  fallbackToEnglishApplied_ = fallbackApplied;
+
+  speechHal_.asr().asrInit(mode, lang, wakeUpMs);
+
+  initialized_ = true;
+  lastInitStatus_ = {StatusCode::Ok, statusMessage};
+
+  Status ttsStatus = initTts(2);
+  if (!ttsStatus.ok()) {
+    USBSerial.printf("speech.init note: %s\n", ttsStatus.message);
+  }
+
+  if (emitProfileTelemetry) {
+    USBSerial.printf("speech.init requested=%s active=%s lang=%u mode=%u wake=%u fallback_en=%s model=%s\n",
+                     profileLabel(requestedProfile_),
+                     profileLabel(activeProfile_),
+                     (unsigned int)activeLang_,
+                     (unsigned int)activeMode_,
+                     (unsigned int)activeWakeUpMs_,
+                     fallbackToEnglishApplied_ ? "yes" : "no",
+                     buildSpeechModelTag().c_str());
+  }
+
+  return lastInitStatus_;
+}
 
 }  // namespace unihiker_pro

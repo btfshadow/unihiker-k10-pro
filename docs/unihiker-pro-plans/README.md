@@ -15,3 +15,10 @@ Planos de migração da SDK para arquitetura multi-camadas.
 10. `plan-10-connectivity.md`
 11. `plan-11-compatibility-and-release.md`
 12. `plan-12-input-navigation.md`
+13. `plan-13-ptbr-speech-model.md`
+14. `plan-14-optimize.md`
+
+## Proximos planos nao executados (fila sugerida)
+1. `plan-10-connectivity.md`
+2. `plan-11-compatibility-and-release.md`
+3. `plan-12-input-navigation.md`

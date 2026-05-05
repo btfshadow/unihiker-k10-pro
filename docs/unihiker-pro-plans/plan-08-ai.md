@@ -33,11 +33,12 @@ Refatorar IA para máquina de estados por modo e contratos de dados estáveis.
 - Estabilidade live: corrigido crash de stack canary no task `vision_feedback` com aumento de stack e remoção de refresh manual concorrente no smoke (overlay passa a ser atualizado por uma única fonte: task interna do service).
 - Estabilidade retorno do live: corrigido bug de fila no framework `unihiker_k10` (`initBgCamerImage` criava `cameDisPlayTask` com `xQueueAI` em vez de `xQueueCamer`), que podia causar `assert failed: xQueueReceive ((pxQueue))` ao reentrar no live.
 - Fase 3 implementada com `captureAndReview(...)` para captura hi-res e visualização da imagem salva.
+- TODO Fase 3 (adiado): estabilizar definitivamente o fluxo de captura em hardware e finalizar despacho da imagem capturada para inferência estática por modo IA.
 - Fase 4 implementada com reader genérico (`analyzeInputText`, `analyzeInputFile`, `analyzeInputBinary`, `analyzeInputAny`) e entrada OCR (`runOcrOnInput`) com retorno claro de `NotSupported` quando engine OCR não está disponível.
 - Criados smokes: `vision_smoke` (troca de modo) e `vision_workflow_smoke` (workflows 2/3/4), com refresh de overlay no modo live.
 
 ## Status de fase
 - Fase 1 concluída: troca de modo isolada com mutex + smoke de stress.
 - Fase 2 concluída: modo live de mira.
-- Fase 3 concluída: captura hi-res + review.
+- Fase 3 parcial/TODO: captura e review existem, mas estabilidade final + despacho IA pós-captura ficam para próximo passo.
 - Fase 4 concluída: input reader + OCR fallback.
