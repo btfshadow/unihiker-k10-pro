@@ -14,12 +14,20 @@ SDK reescrita para UNIHIKER K10 com arquitetura multi-camadas:
 - `src/unihiker_pro.h`
 
 ## Objetivos
-- Facilitar extensão e manutenção
+- Substituir progressivamente a lib original do UNIHIKER com implementacao propria e publicavel
+- Oferecer API em dois niveis: uso simplificado e uso completo/avancado
+- Facilitar extensao e manutencao
 - Reduzir acoplamento
-- Permitir evolução segura com compatibilidade progressiva
+- Permitir evolucao segura com compatibilidade progressiva
+- Otimizar desempenho e previsibilidade de comportamento em hardware real
+- Aumentar cobertura de validacao com testes unitarios e smokes por dominio
 
 ## Status
-Versão inicial com wrappers funcionais sobre drivers originais e contratos de serviço para evolução incremental.
+- Versao inicial com wrappers funcionais sobre drivers originais e contratos de servico para evolucao incremental.
+
+## Direcao de evolucao
+- `external_packages/` e tratado como base de referencia tecnica, nao como limite de implementacao.
+- Evolucoes devem ocorrer por padrao em `unihiker-pro/`, com foco em qualidade de API, configurabilidade e eficiencia.
 
 ## Estado atual
 - Foundation fechada com `core`, `hal`, `services` e `facade`
