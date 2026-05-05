@@ -19,7 +19,8 @@ UniHikerPro::UniHikerPro()
       storageService_(*boardHalRef_),
       cameraService_(*boardHalRef_, &inputService_),
       audioService_(*boardHalRef_, *audioHalRef_),
-      visionService_(*boardHalRef_, *visionHalRef_),
+      visionService_(*boardHalRef_, *visionHalRef_,
+             &cameraService_, &storageService_, &displayService_),
       speechService_(*speechHalRef_) {}
 
 UniHikerPro::UniHikerPro(IBoardHal &boardHal, IVisionHal &visionHal,
@@ -40,7 +41,8 @@ UniHikerPro::UniHikerPro(IBoardHal &boardHal, IVisionHal &visionHal,
       storageService_(*boardHalRef_),
       cameraService_(*boardHalRef_, &inputService_),
       audioService_(*boardHalRef_, *audioHalRef_),
-      visionService_(*boardHalRef_, *visionHalRef_),
+      visionService_(*boardHalRef_, *visionHalRef_,
+             &cameraService_, &storageService_, &displayService_),
       speechService_(*speechHalRef_) {}
 
 Status UniHikerPro::begin(const BootOptions &options) {

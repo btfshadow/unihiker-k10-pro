@@ -239,6 +239,26 @@ struct StorageHealth {
   uint64_t usedBytes = 0;
 };
 
+enum class VisionWorkflowMode : uint8_t {
+  LiveAim = 0,
+  CaptureReview,
+  InputReader,
+  Ocr,
+};
+
+struct VisionWorkflowResult {
+  bool ok = false;
+  VisionWorkflowMode workflow = VisionWorkflowMode::LiveAim;
+  AiMode mode = AiMode::None;
+  bool detected = false;
+  bool recognized = false;
+  int recognitionId = -1;
+  bool ocrSupported = false;
+  size_t analyzedBytes = 0;
+  String source;
+  String summary;
+};
+
 class CameraService {
  public:
   explicit CameraService(IBoardHal &hal, InputService *input = nullptr)
@@ -494,10 +514,24 @@ class AudioService {
 
 class VisionService {
  public:
-  VisionService(IBoardHal &boardHal, IVisionHal &visionHal)
+  VisionService(IBoardHal &boardHal,
+                IVisionHal &visionHal,
+                CameraService *cameraService = nullptr,
+                StorageService *storageService = nullptr,
+                DisplayService *displayService = nullptr)
       : boardHal_(boardHal),
         visionHal_(visionHal),
+        cameraService_(cameraService),
+        storageService_(storageService),
+        displayService_(displayService),
+        workflowMode_(VisionWorkflowMode::LiveAim),
         currentMode_(AiMode::None),
+        activeHalMode_(AiMode::None),
+        liveAimActive_(false),
+        liveFeedbackEnabled_(true),
+        liveFeedbackStopRequested_(false),
+        liveFeedbackTask_(nullptr),
+        liveFeedbackPeriodMs_(120),
         initialized_(false),
         stateMutex_(xSemaphoreCreateMutex()),
         modeSwitchCount_(0) {}
@@ -506,18 +540,80 @@ class VisionService {
   Status setMode(AiMode mode);
   AiMode mode() const { return currentMode_; }
   uint32_t modeSwitchCount() const { return modeSwitchCount_; }
+  Status setWorkflowMode(VisionWorkflowMode workflowMode);
+  VisionWorkflowMode workflowMode() const { return workflowMode_; }
+  const VisionWorkflowResult &lastWorkflowResult() const { return lastWorkflowResult_; }
+
+  // Phase 1: live camera assist mode for aiming.
+  Status startLiveAim(bool drawHints = true);
+  Status stopLiveAim();
+  Status setLiveFeedbackEnabled(bool enabled);
+  bool liveFeedbackEnabled() const { return liveFeedbackEnabled_; }
+  Status setLiveFeedbackPeriodMs(uint32_t periodMs);
+  uint32_t liveFeedbackPeriodMs() const { return liveFeedbackPeriodMs_; }
+  Status refreshLiveAimFeedback(bool drawAimReticle = true);
+  String describeCurrentPerception();
+  bool liveAimActive() const { return liveAimActive_; }
+
+  // Phase 2: capture hi-res and review saved image.
+  Status captureAndReview(const String &fileNameOrPath,
+                          framesize_t framesize = FRAMESIZE_UXGA,
+                          const String &dirOverride = "");
+
+  // Phase 3: generic input reader (text/file/binary).
+  Status analyzeInputText(const String &payload);
+  Status analyzeInputFile(const String &fileNameOrPath,
+                          const String &dirOverride = "");
+  Status analyzeInputBinary(const uint8_t *data, size_t bytes);
+  Status analyzeInputAny(const String &payloadOrPath);
+
+  // Phase 4: OCR entrypoint with explicit fallback when OCR engine is absent.
+  Status runOcrOnInput(const String &payloadOrPath, String *outText = nullptr);
+
   bool detected();
+  bool recognized();
+  int recognitionId();
+  Status setMotionThreshold(uint8_t threshold);
   int faceData(AIRecognition::eFaceOrCatData_t type);
   int catData(AIRecognition::eFaceOrCatData_t type);
   String qrPayload();
 
  private:
+  bool isFaceCommandMode(AiMode mode) const;
+  AiMode mapToHalMode(AiMode mode) const;
+  recognizer_state_t mapFaceCommand(AiMode mode) const;
+  bool isTextExtension(const String &extLower) const;
+  bool isImageExtension(const String &extLower) const;
+  bool isAudioExtension(const String &extLower) const;
+  String extensionLower(const String &path) const;
+  String resolveInputPath(const String &fileNameOrPath, bool *found) const;
+  String buildPerceptionSummary(AiMode mode, VisionWorkflowMode workflowMode);
+  static void liveFeedbackTaskThunk(void *arg);
+  void ensureLiveFeedbackTask();
+  void stopLiveFeedbackTask();
+  void setWorkflowResult(bool ok,
+                         const String &source,
+                         const String &summary,
+                         size_t analyzedBytes = 0,
+                         bool ocrSupported = false);
+
   Status lockState();
   void unlockState();
 
   IBoardHal &boardHal_;
   IVisionHal &visionHal_;
+  CameraService *cameraService_;
+  StorageService *storageService_;
+  DisplayService *displayService_;
+  VisionWorkflowMode workflowMode_;
+  VisionWorkflowResult lastWorkflowResult_;
   AiMode currentMode_;
+  AiMode activeHalMode_;
+  bool liveAimActive_;
+  bool liveFeedbackEnabled_;
+  volatile bool liveFeedbackStopRequested_;
+  TaskHandle_t liveFeedbackTask_;
+  uint32_t liveFeedbackPeriodMs_;
   bool initialized_;
   SemaphoreHandle_t stateMutex_;
   uint32_t modeSwitchCount_;

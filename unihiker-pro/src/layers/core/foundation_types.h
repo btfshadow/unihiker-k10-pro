@@ -35,9 +35,13 @@ struct BootOptions {
 enum class AiMode {
   None = 0,
   Face,
+  FaceRecognize,
+  FaceEnroll,
+  FaceDeleteAll,
   Cat,
   Move,
   Code,
+  Ocr,
 };
 
 enum class ButtonId {

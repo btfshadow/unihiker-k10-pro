@@ -7,6 +7,7 @@
 #include <esp_camera.h>
 #include <freertos/FreeRTOS.h>
 #include <freertos/semphr.h>
+#include <freertos/task.h>
 #include <img_converters.h>
 #include <SD.h>
 #include <unihiker_k10.h>
@@ -41,6 +42,20 @@ static const char *kLiveResKey = "res";
 static const char *kLivePhotoKey = "photo";
 static const uint32_t kCaptureBootSettleMs = 1200;
 static const uint32_t kCaptureWarmupMs = 2000;
+static const uint32_t kVisionFeedbackTaskStackBytes = 8192;
+
+static String fixedOverlayText(const String &input, size_t width) {
+  String out = input;
+  out.replace('\n', ' ');
+  out.replace('\r', ' ');
+  if (out.length() > width) {
+    out = out.substring(0, width);
+  }
+  while (out.length() < width) {
+    out += ' ';
+  }
+  return out;
+}
 
 enum LiveRole : uint8_t {
   LiveRoleMenu = 0,
@@ -2429,6 +2444,9 @@ Status VisionService::init() {
     return status;
   }
   currentMode_ = AiMode::None;
+  activeHalMode_ = AiMode::None;
+  liveAimActive_ = false;
+  liveFeedbackEnabled_ = true;
   initialized_ = true;
   modeSwitchCount_ = 0;
   unlockState();
@@ -2444,20 +2462,436 @@ Status VisionService::setMode(AiMode mode) {
     return Status::Error(StatusCode::NotInitialized, "vision not initialized");
   }
 
-  if (mode == currentMode_) {
+  bool commandMode = isFaceCommandMode(mode);
+
+  if (mode == currentMode_ && !commandMode) {
     unlockState();
     return Status::OkStatus();
   }
 
-  auto status = visionHal_.switchMode(mode);
-  if (!status.ok()) {
-    unlockState();
-    return status;
+  AiMode targetHalMode = mapToHalMode(mode);
+  if (targetHalMode != activeHalMode_) {
+    auto status = visionHal_.switchMode(targetHalMode);
+    if (!status.ok()) {
+      unlockState();
+      return status;
+    }
+    activeHalMode_ = targetHalMode;
   }
+
+  if (commandMode) {
+    visionHal_.ai().sendFaceCmd(mapFaceCommand(mode));
+  }
+
   currentMode_ = mode;
   modeSwitchCount_++;
   unlockState();
   return Status::OkStatus();
+}
+
+Status VisionService::setWorkflowMode(VisionWorkflowMode workflowMode) {
+  Status st = lockState();
+  if (!st.ok()) return st;
+  workflowMode_ = workflowMode;
+  unlockState();
+  return Status::OkStatus();
+}
+
+Status VisionService::startLiveAim(bool drawHints) {
+  if (!cameraService_) {
+    return Status::Error(StatusCode::NotSupported,
+                         "live aim requires camera service linkage");
+  }
+
+  Status st = setWorkflowMode(VisionWorkflowMode::LiveAim);
+  if (!st.ok()) return st;
+
+  st = cameraService_->start();
+  if (!st.ok()) {
+    setWorkflowResult(false, "camera/live", st.message);
+    return st;
+  }
+
+  liveFeedbackEnabled_ = drawHints;
+  liveAimActive_ = true;
+  if (displayService_) {
+    (void)displayService_->setCameraBackground(true);
+  }
+
+  String summary = describeCurrentPerception();
+
+  if (liveFeedbackEnabled_ && displayService_) {
+    String title = fixedOverlayText("vision live aim", 22);
+    String summaryLine = fixedOverlayText(summary, 28);
+    String hint = fixedOverlayText("mire o alvo no centro", 26);
+
+    (void)displayService_->clearCanvas();
+    (void)displayService_->setFontSize(Canvas::eCNAndENFont16);
+    (void)displayService_->textAt(title, 8, 10, 0xFFFFFF, 24, false);
+    (void)displayService_->textAt(summaryLine, 8, 32, 0xCFE8FF, 32, false);
+    (void)displayService_->drawLine(113, 160, 127, 160, 0x66FF66);
+    (void)displayService_->drawLine(120, 153, 120, 167, 0x66FF66);
+    (void)displayService_->textAt(hint, 8, 292, 0xDDEAFF, 28, false);
+    (void)displayService_->update();
+  } else if (displayService_) {
+    // Keep plain camera preview when feedback overlay is disabled.
+    (void)displayService_->clearCanvas();
+    (void)displayService_->update();
+  }
+
+  setWorkflowResult(true, "camera/live", summary);
+
+  if (liveFeedbackEnabled_) {
+    ensureLiveFeedbackTask();
+  } else {
+    stopLiveFeedbackTask();
+  }
+
+  return Status::OkStatus();
+}
+
+Status VisionService::stopLiveAim() {
+  if (!cameraService_) {
+    return Status::Error(StatusCode::NotSupported,
+                         "live aim requires camera service linkage");
+  }
+
+  liveAimActive_ = false;
+  stopLiveFeedbackTask();
+
+  Status st = cameraService_->stop();
+  if (!st.ok()) {
+    setWorkflowResult(false, "camera/live", st.message);
+    return st;
+  }
+
+  // Leave live with AI pipeline idle to avoid background "searching" state.
+  Status aiStop = setMode(AiMode::None);
+  if (!aiStop.ok()) {
+    setWorkflowResult(false, "camera/live", aiStop.message);
+    return aiStop;
+  }
+
+  liveFeedbackEnabled_ = true;
+
+  setWorkflowResult(true, "camera/live", "live aim stopped");
+  return Status::OkStatus();
+}
+
+Status VisionService::setLiveFeedbackEnabled(bool enabled) {
+  liveFeedbackEnabled_ = enabled;
+
+  if (liveAimActive_ && enabled) {
+    Status st = refreshLiveAimFeedback(true);
+    if (!st.ok()) return st;
+    ensureLiveFeedbackTask();
+    return Status::OkStatus();
+  }
+
+  if (liveAimActive_ && !enabled && displayService_) {
+    stopLiveFeedbackTask();
+    // Keep camera preview, hide overlay text/reticle.
+    (void)displayService_->setCameraBackground(true);
+    (void)displayService_->clearCanvas();
+    (void)displayService_->update();
+  }
+
+  return Status::OkStatus();
+}
+
+Status VisionService::setLiveFeedbackPeriodMs(uint32_t periodMs) {
+  if (periodMs < 40 || periodMs > 2000) {
+    return Status::Error(StatusCode::InvalidArgument,
+                         "live feedback period must be in [40,2000] ms");
+  }
+
+  liveFeedbackPeriodMs_ = periodMs;
+  return Status::OkStatus();
+}
+
+Status VisionService::refreshLiveAimFeedback(bool drawAimReticle) {
+  if (!liveAimActive_) {
+    return Status::Error(StatusCode::Busy, "live aim not active");
+  }
+
+  String summary = describeCurrentPerception();
+  bool det = detected();
+
+  if (!liveFeedbackEnabled_) {
+    setWorkflowResult(true, "camera/live", summary);
+    lastWorkflowResult_.detected = det;
+    lastWorkflowResult_.recognized = recognized();
+    lastWorkflowResult_.recognitionId = recognitionId();
+    return Status::OkStatus();
+  }
+
+  if (displayService_) {
+    String title = fixedOverlayText("vision live aim", 22);
+    String summaryLine = fixedOverlayText(summary, 30);
+    String statusLine = fixedOverlayText(det ? "detectado" : "varrendo cena", 24);
+    uint32_t color = det ? 0x66FF66 : 0xCFE8FF;
+    (void)displayService_->setFontSize(Canvas::eCNAndENFont16);
+    (void)displayService_->textAt(title, 8, 10, 0xFFFFFF, 24, false);
+    (void)displayService_->textAt(summaryLine, 8, 32, color, 34, false);
+    if (drawAimReticle) {
+      (void)displayService_->drawLine(113, 160, 127, 160, 0x66FF66);
+      (void)displayService_->drawLine(120, 153, 120, 167, 0x66FF66);
+    }
+    (void)displayService_->textAt(statusLine, 8, 292, color, 28, false);
+    (void)displayService_->update();
+  }
+
+  setWorkflowResult(true, "camera/live", summary);
+  lastWorkflowResult_.detected = det;
+  lastWorkflowResult_.recognized = recognized();
+  lastWorkflowResult_.recognitionId = recognitionId();
+  return Status::OkStatus();
+}
+
+String VisionService::describeCurrentPerception() {
+  if (!initialized_) return String("vision nao inicializada");
+
+  Status st = lockState();
+  if (!st.ok()) return String("vision state busy");
+
+  AiMode mode = currentMode_;
+  VisionWorkflowMode workflow = workflowMode_;
+  unlockState();
+
+  return buildPerceptionSummary(mode, workflow);
+}
+
+Status VisionService::captureAndReview(const String &fileNameOrPath,
+                                       framesize_t framesize,
+                                       const String &dirOverride) {
+  if (!cameraService_ || !storageService_) {
+    return Status::Error(StatusCode::NotSupported,
+                         "capture-review requires camera+storage linkage");
+  }
+
+  Status st = setWorkflowMode(VisionWorkflowMode::CaptureReview);
+  if (!st.ok()) return st;
+
+  String targetPath = fileNameOrPath;
+  if (!targetPath.startsWith("S:/")) {
+    targetPath = storageService_->imagePath(fileNameOrPath, dirOverride);
+  }
+
+  st = cameraService_->captureHiRes(targetPath, framesize, nullptr);
+  if (!st.ok()) {
+    setWorkflowResult(false, targetPath, st.message);
+    return st;
+  }
+
+  if (displayService_) {
+    (void)displayService_->clearCanvas();
+    (void)displayService_->drawImage(0, 0, targetPath);
+    (void)displayService_->setFontSize(Canvas::eCNAndENFont16);
+    (void)displayService_->textAt("capture review", 8, 8, 0xFFFFFF, 22, true);
+    (void)displayService_->update();
+  }
+
+  setWorkflowResult(true, targetPath, "hi-res captured and reviewed");
+  lastWorkflowResult_.detected = detected();
+  return Status::OkStatus();
+}
+
+Status VisionService::analyzeInputText(const String &payload) {
+  String text = payload;
+  text.trim();
+  if (text.length() == 0) {
+    setWorkflowResult(false, "text-inline", "empty text payload");
+    return Status::Error(StatusCode::InvalidArgument, "empty text payload");
+  }
+
+  Status st = setWorkflowMode(VisionWorkflowMode::InputReader);
+  if (!st.ok()) return st;
+
+  String lower = text;
+  for (size_t i = 0; i < lower.length(); i++) {
+    char c = lower[i];
+    if (c >= 'A' && c <= 'Z') lower.setCharAt(i, c + ('a' - 'A'));
+  }
+
+  String summary = "plain text";
+  if (text.startsWith("{") || text.startsWith("[")) {
+    summary = "json-like text";
+  } else if (text.indexOf(',') >= 0 && text.indexOf('\n') >= 0) {
+    summary = "csv-like text";
+  } else if (lower.startsWith("http://") || lower.startsWith("https://")) {
+    summary = "url text";
+  }
+
+  setWorkflowResult(true, "text-inline", summary, text.length());
+
+  if (displayService_) {
+    String preview = text.substring(0, 42);
+    (void)displayService_->setBackground(0xFFFFFF);
+    (void)displayService_->clearCanvas();
+    (void)displayService_->textRow("input reader", 1, 0x000000);
+    (void)displayService_->setFontSize(Canvas::eCNAndENFont16);
+    (void)displayService_->textAt(summary, 10, 70, 0x006600, 28, true);
+    (void)displayService_->textAt(preview, 10, 96, 0x000000, 36, true);
+    (void)displayService_->update();
+  }
+
+  return Status::OkStatus();
+}
+
+Status VisionService::analyzeInputFile(const String &fileNameOrPath,
+                                       const String &dirOverride) {
+  if (!storageService_) {
+    return Status::Error(StatusCode::NotSupported,
+                         "input file reader requires storage linkage");
+  }
+
+  Status st = setWorkflowMode(VisionWorkflowMode::InputReader);
+  if (!st.ok()) return st;
+
+  bool found = false;
+  String inputPath = resolveInputPath(fileNameOrPath, &found);
+
+  if (!found && dirOverride.length() > 0) {
+    String overridePath = storageService_->dataPath(fileNameOrPath, dirOverride);
+    bool exists = false;
+    (void)storageService_->fileExists(overridePath, &exists);
+    if (exists) {
+      inputPath = overridePath;
+      found = true;
+    }
+  }
+
+  if (!found || inputPath.length() == 0) {
+    setWorkflowResult(false, fileNameOrPath, "input file not found");
+    return Status::Error(StatusCode::IOError, "input file not found");
+  }
+
+  String ext = extensionLower(inputPath);
+  if (isTextExtension(ext)) {
+    String content;
+    st = storageService_->readTextFile(inputPath, &content, 12288);
+    if (!st.ok()) {
+      setWorkflowResult(false, inputPath, st.message);
+      return st;
+    }
+
+    String summary = String("text file (") + ext + ")";
+    setWorkflowResult(true, inputPath, summary, storageService_->lastReadBytes());
+
+    if (displayService_) {
+      String preview = content.substring(0, 42);
+      (void)displayService_->setBackground(0xFFFFFF);
+      (void)displayService_->clearCanvas();
+      (void)displayService_->textRow("input file", 1, 0x000000);
+      (void)displayService_->setFontSize(Canvas::eCNAndENFont16);
+      (void)displayService_->textAt(summary, 10, 70, 0x006600, 28, true);
+      (void)displayService_->textAt(preview, 10, 96, 0x000000, 36, true);
+      (void)displayService_->update();
+    }
+    return Status::OkStatus();
+  }
+
+  if (isImageExtension(ext)) {
+    if (displayService_) {
+      (void)displayService_->clearCanvas();
+      (void)displayService_->drawImage(0, 0, inputPath);
+      (void)displayService_->setFontSize(Canvas::eCNAndENFont16);
+      (void)displayService_->textAt("image input loaded", 8, 8, 0xFFFFFF, 26, true);
+      (void)displayService_->update();
+    }
+    setWorkflowResult(true, inputPath, "image file loaded");
+    return Status::OkStatus();
+  }
+
+  uint32_t size = 0;
+  st = storageService_->fileSize(inputPath, &size);
+  if (!st.ok()) {
+    setWorkflowResult(false, inputPath, st.message);
+    return st;
+  }
+
+  String summary = isAudioExtension(ext) ? "audio file indexed" : "binary file indexed";
+  setWorkflowResult(true, inputPath, summary, size);
+
+  if (displayService_) {
+    (void)displayService_->setBackground(0xFFFFFF);
+    (void)displayService_->clearCanvas();
+    (void)displayService_->textRow("input file", 1, 0x000000);
+    (void)displayService_->setFontSize(Canvas::eCNAndENFont16);
+    (void)displayService_->textAt(summary, 10, 70, 0x006600, 28, true);
+    (void)displayService_->textAt(String("bytes: ") + String((unsigned long)size),
+                                  10, 96, 0x000000, 30, true);
+    (void)displayService_->update();
+  }
+
+  return Status::OkStatus();
+}
+
+Status VisionService::analyzeInputBinary(const uint8_t *data, size_t bytes) {
+  if (data == nullptr || bytes == 0) {
+    setWorkflowResult(false, "memory-binary", "invalid binary payload");
+    return Status::Error(StatusCode::InvalidArgument, "invalid binary payload");
+  }
+
+  Status st = setWorkflowMode(VisionWorkflowMode::InputReader);
+  if (!st.ok()) return st;
+
+  uint32_t checksum = 0;
+  for (size_t i = 0; i < bytes; i++) checksum += data[i];
+
+  String preview;
+  for (size_t i = 0; i < bytes && i < 8; i++) {
+    char buf[6];
+    snprintf(buf, sizeof(buf), "%02X ", data[i]);
+    preview += buf;
+  }
+
+  String summary = String("binary checksum=") + String((unsigned long)checksum);
+  setWorkflowResult(true, "memory-binary", summary, bytes);
+
+  if (displayService_) {
+    (void)displayService_->setBackground(0xFFFFFF);
+    (void)displayService_->clearCanvas();
+    (void)displayService_->textRow("input binary", 1, 0x000000);
+    (void)displayService_->setFontSize(Canvas::eCNAndENFont16);
+    (void)displayService_->textAt(summary, 10, 70, 0x006600, 30, true);
+    (void)displayService_->textAt(preview, 10, 96, 0x000000, 36, true);
+    (void)displayService_->update();
+  }
+
+  return Status::OkStatus();
+}
+
+Status VisionService::analyzeInputAny(const String &payloadOrPath) {
+  bool found = false;
+  String path = resolveInputPath(payloadOrPath, &found);
+  if (found && path.length() > 0) {
+    return analyzeInputFile(path);
+  }
+
+  if (payloadOrPath.startsWith("S:/")) {
+    setWorkflowResult(false, payloadOrPath, "input file not found");
+    return Status::Error(StatusCode::IOError, "input file not found");
+  }
+
+  return analyzeInputText(payloadOrPath);
+}
+
+Status VisionService::runOcrOnInput(const String &payloadOrPath, String *outText) {
+  Status st = setWorkflowMode(VisionWorkflowMode::Ocr);
+  if (!st.ok()) return st;
+
+  st = setMode(AiMode::Ocr);
+  if (!st.ok()) return st;
+
+  if (outText) {
+    outText->remove(0);
+  }
+
+  setWorkflowResult(false, payloadOrPath,
+                    "OCR engine not available in current firmware", 0, false);
+  return Status::Error(StatusCode::NotSupported,
+                       "OCR engine not available in current firmware");
 }
 
 bool VisionService::detected() {
@@ -2472,6 +2906,9 @@ bool VisionService::detected() {
   auto &ai = visionHal_.ai();
   switch (activeMode) {
     case AiMode::Face:
+    case AiMode::FaceRecognize:
+    case AiMode::FaceEnroll:
+    case AiMode::FaceDeleteAll:
       return ai.isDetectContent(AIRecognition::Face);
     case AiMode::Cat:
       return ai.isDetectContent(AIRecognition::Cat);
@@ -2479,10 +2916,34 @@ bool VisionService::detected() {
       return ai.isDetectContent(AIRecognition::Move);
     case AiMode::Code:
       return ai.isDetectContent(AIRecognition::Code);
+    case AiMode::Ocr:
+      return false;
     case AiMode::None:
     default:
       return false;
   }
+}
+
+bool VisionService::recognized() {
+  if (!initialized_) return false;
+  return visionHal_.ai().isRecognized();
+}
+
+int VisionService::recognitionId() {
+  if (!initialized_) return -1;
+  return visionHal_.ai().getRecognitionID();
+}
+
+Status VisionService::setMotionThreshold(uint8_t threshold) {
+  if (!initialized_) {
+    return Status::Error(StatusCode::NotInitialized, "vision not initialized");
+  }
+  if (threshold < 10 || threshold > 200) {
+    return Status::Error(StatusCode::InvalidArgument,
+                         "motion threshold must be in [10,200]");
+  }
+  visionHal_.ai().setMotinoThreshold(threshold);
+  return Status::OkStatus();
 }
 
 int VisionService::faceData(AIRecognition::eFaceOrCatData_t type) {
@@ -2514,6 +2975,239 @@ void VisionService::unlockState() {
   if (stateMutex_) {
     xSemaphoreGive(stateMutex_);
   }
+}
+
+bool VisionService::isFaceCommandMode(AiMode mode) const {
+  switch (mode) {
+    case AiMode::FaceRecognize:
+    case AiMode::FaceEnroll:
+    case AiMode::FaceDeleteAll:
+      return true;
+    default:
+      return false;
+  }
+}
+
+AiMode VisionService::mapToHalMode(AiMode mode) const {
+  switch (mode) {
+    case AiMode::Face:
+    case AiMode::FaceRecognize:
+    case AiMode::FaceEnroll:
+    case AiMode::FaceDeleteAll:
+      return AiMode::Face;
+    case AiMode::Cat:
+      return AiMode::Cat;
+    case AiMode::Move:
+      return AiMode::Move;
+    case AiMode::Code:
+      return AiMode::Code;
+    case AiMode::Ocr:
+      return AiMode::None;
+    case AiMode::None:
+    default:
+      return AiMode::None;
+  }
+}
+
+recognizer_state_t VisionService::mapFaceCommand(AiMode mode) const {
+  switch (mode) {
+    case AiMode::FaceEnroll:
+      return ENROLL;
+    case AiMode::FaceDeleteAll:
+      return DELETEALL;
+    case AiMode::FaceRecognize:
+    default:
+      return RECOGNIZE;
+  }
+}
+
+bool VisionService::isTextExtension(const String &extLower) const {
+  return extLower == "txt" || extLower == "json" || extLower == "csv" ||
+         extLower == "log" || extLower == "md";
+}
+
+bool VisionService::isImageExtension(const String &extLower) const {
+  return extLower == "bmp" || extLower == "jpg" || extLower == "jpeg" ||
+         extLower == "png" || extLower == "gif";
+}
+
+bool VisionService::isAudioExtension(const String &extLower) const {
+  return extLower == "wav" || extLower == "pcm";
+}
+
+String VisionService::extensionLower(const String &path) const {
+  int dot = path.lastIndexOf('.');
+  if (dot < 0 || dot + 1 >= (int)path.length()) {
+    return String();
+  }
+
+  String ext = path.substring(dot + 1);
+  for (size_t i = 0; i < ext.length(); i++) {
+    char c = ext[i];
+    if (c >= 'A' && c <= 'Z') ext.setCharAt(i, c + ('a' - 'A'));
+  }
+  return ext;
+}
+
+String VisionService::resolveInputPath(const String &fileNameOrPath, bool *found) const {
+  if (found) *found = false;
+  if (!storageService_) return String();
+
+  auto checkPath = [&](const String &p) -> bool {
+    bool exists = false;
+    Status st = storageService_->fileExists(p, &exists);
+    return st.ok() && exists;
+  };
+
+  if (fileNameOrPath.startsWith("S:/")) {
+    bool exists = checkPath(fileNameOrPath);
+    if (found) *found = exists;
+    return exists ? fileNameOrPath : String();
+  }
+
+  String candidates[4] = {
+    storageService_->dataPath(fileNameOrPath),
+    storageService_->imagePath(fileNameOrPath),
+    storageService_->audioPath(fileNameOrPath),
+    String("S:/") + fileNameOrPath,
+  };
+
+  for (size_t i = 0; i < 4; i++) {
+    if (checkPath(candidates[i])) {
+      if (found) *found = true;
+      return candidates[i];
+    }
+  }
+
+  return String();
+}
+
+String VisionService::buildPerceptionSummary(AiMode mode, VisionWorkflowMode workflowMode) {
+  auto &ai = visionHal_.ai();
+
+  if (ai.isDetectContent(AIRecognition::Code)) {
+    String payload = ai.getQrCodeContent();
+    payload.replace('\n', ' ');
+    payload.trim();
+    if (payload.length() == 0) {
+      return String("QR detectado");
+    }
+    if (payload.length() > 24) {
+      payload = payload.substring(0, 24) + "...";
+    }
+    return String("QR: ") + payload;
+  }
+
+  if (ai.isDetectContent(AIRecognition::Face)) {
+    if (ai.isRecognized()) {
+      int id = ai.getRecognitionID();
+      if (id >= 0) {
+        return String("Rosto reconhecido id=") + String(id);
+      }
+      return String("Rosto reconhecido");
+    }
+    return String("Rosto detectado");
+  }
+
+  if (ai.isDetectContent(AIRecognition::Cat)) {
+    return String("Objeto/cat detectado");
+  }
+
+  if (ai.isDetectContent(AIRecognition::Move)) {
+    return String("Movimento detectado");
+  }
+
+  if (workflowMode == VisionWorkflowMode::Ocr) {
+    return String("Texto: OCR indisponivel");
+  }
+
+  switch (mode) {
+    case AiMode::Code:
+      return String("Procurando QR...");
+    case AiMode::Ocr:
+      return String("Texto: OCR indisponivel");
+    case AiMode::Face:
+    case AiMode::FaceRecognize:
+    case AiMode::FaceEnroll:
+    case AiMode::FaceDeleteAll:
+      return String("Procurando rosto...");
+    case AiMode::Cat:
+      return String("Procurando objeto/cat...");
+    case AiMode::Move:
+      return String("Procurando movimento...");
+    case AiMode::None:
+    default:
+      return String("IA aguardando modo (texto requer OCR)");
+  }
+}
+
+void VisionService::liveFeedbackTaskThunk(void *arg) {
+  VisionService *self = static_cast<VisionService *>(arg);
+  if (!self) {
+    vTaskDelete(nullptr);
+    return;
+  }
+
+  while (self->liveAimActive_ &&
+         self->liveFeedbackEnabled_ &&
+         !self->liveFeedbackStopRequested_) {
+    (void)self->refreshLiveAimFeedback(true);
+    if (ulTaskNotifyTake(pdTRUE, pdMS_TO_TICKS(self->liveFeedbackPeriodMs_)) > 0) {
+      break;
+    }
+  }
+
+  self->liveFeedbackTask_ = nullptr;
+  vTaskDelete(nullptr);
+}
+
+void VisionService::ensureLiveFeedbackTask() {
+  if (liveFeedbackTask_ != nullptr) {
+    return;
+  }
+
+  liveFeedbackStopRequested_ = false;
+
+  BaseType_t ok = xTaskCreate(&VisionService::liveFeedbackTaskThunk,
+                              "vision_feedback",
+                              kVisionFeedbackTaskStackBytes,
+                              this,
+                              1,
+                              &liveFeedbackTask_);
+  if (ok != pdPASS) {
+    liveFeedbackTask_ = nullptr;
+  }
+}
+
+void VisionService::stopLiveFeedbackTask() {
+  liveFeedbackStopRequested_ = true;
+
+  TaskHandle_t task = liveFeedbackTask_;
+  if (task != nullptr) {
+    xTaskNotifyGive(task);
+
+    uint32_t t0 = millis();
+    while (liveFeedbackTask_ != nullptr && (millis() - t0) < 800) {
+      vTaskDelay(pdMS_TO_TICKS(10));
+    }
+  }
+}
+
+void VisionService::setWorkflowResult(bool ok,
+                                      const String &source,
+                                      const String &summary,
+                                      size_t analyzedBytes,
+                                      bool ocrSupported) {
+  lastWorkflowResult_.ok = ok;
+  lastWorkflowResult_.workflow = workflowMode_;
+  lastWorkflowResult_.mode = currentMode_;
+  lastWorkflowResult_.detected = initialized_ ? detected() : false;
+  lastWorkflowResult_.recognized = initialized_ ? recognized() : false;
+  lastWorkflowResult_.recognitionId = lastWorkflowResult_.recognized ? recognitionId() : -1;
+  lastWorkflowResult_.ocrSupported = ocrSupported;
+  lastWorkflowResult_.analyzedBytes = analyzedBytes;
+  lastWorkflowResult_.source = source;
+  lastWorkflowResult_.summary = summary;
 }
 
 void SpeechService::begin(uint8_t mode, uint8_t lang, uint16_t wakeUpMs) {

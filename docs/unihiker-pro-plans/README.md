@@ -14,3 +14,4 @@ Planos de migração da SDK para arquitetura multi-camadas.
 9. `plan-09-speech.md`
 10. `plan-10-connectivity.md`
 11. `plan-11-compatibility-and-release.md`
+12. `plan-12-input-navigation.md`

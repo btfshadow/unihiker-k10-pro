@@ -136,6 +136,9 @@ Status LegacyVisionHal::switchMode(AiMode mode) {
 
   switch (mode) {
     case AiMode::Face:
+    case AiMode::FaceRecognize:
+    case AiMode::FaceEnroll:
+    case AiMode::FaceDeleteAll:
       ai_.switchAiMode(AIRecognition::Face);
       break;
     case AiMode::Cat:
@@ -146,6 +149,9 @@ Status LegacyVisionHal::switchMode(AiMode mode) {
       break;
     case AiMode::Code:
       ai_.switchAiMode(AIRecognition::Code);
+      break;
+    case AiMode::Ocr:
+      ai_.switchAiMode(AIRecognition::NoMode);
       break;
     case AiMode::None:
     default:
