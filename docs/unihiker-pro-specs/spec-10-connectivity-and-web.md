@@ -18,6 +18,12 @@
 
 ## Requisitos para unihiker-pro
 - Connectivity service separado do core multimídia
-- API mínima: connect/disconnect/status/ip
+- API de Wi-Fi para uso SDK/importador:
+  - connect/disconnect/status/ip
+  - perfis conhecidos persistidos em NVS
+  - reconexao rapida no reboot sem scan total quando possivel
+  - scan completo com metadados (RSSI/canal/BSSID/seguranca)
+  - parse/config de credenciais por QRCode (`WIFI:T:...;S:...;P:...;;`)
+  - analise de ambiente Wi-Fi para diagnostico em campo
 - Extensões opcionais para HTTP e descoberta local
 - Design para feature flags (habilitar/desabilitar por build)

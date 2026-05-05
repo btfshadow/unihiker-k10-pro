@@ -2,6 +2,7 @@
 
 #include <Arduino.h>
 #include <Preferences.h>
+#include <WiFi.h>
 #include <Wire.h>
 #include <asr.h>
 #include <esp_camera.h>
@@ -10,6 +11,7 @@
 #include <freertos/task.h>
 #include <img_converters.h>
 #include <SD.h>
+#include <string.h>
 #include <unihiker_k10.h>
 #include <who_camera.h>
 
@@ -251,6 +253,68 @@ static SpeechProfile profileFromBuildModelTag() {
 
 static uint8_t langFromProfile(SpeechProfile profile) {
   return profile == SpeechProfile::Chinese ? 0 : 1;
+}
+
+static String trimCopy(const String &input) {
+  String out = input;
+  out.trim();
+  return out;
+}
+
+static String normalizeSsidKey(const String &ssid) {
+  String out = trimCopy(ssid);
+  out.toLowerCase();
+  return out;
+}
+
+static uint8_t rssiToQuality(int32_t rssi) {
+  if (rssi <= -100) return 0;
+  if (rssi >= -50) return 100;
+  return (uint8_t)(2 * (rssi + 100));
+}
+
+static String wifiMacToString(const uint8_t *mac) {
+  if (mac == nullptr) return String();
+  char out[18];
+  snprintf(out,
+           sizeof(out),
+           "%02X:%02X:%02X:%02X:%02X:%02X",
+           mac[0],
+           mac[1],
+           mac[2],
+           mac[3],
+           mac[4],
+           mac[5]);
+  return String(out);
+}
+
+static int parseHexNibble(char c) {
+  if (c >= '0' && c <= '9') return c - '0';
+  if (c >= 'a' && c <= 'f') return 10 + (c - 'a');
+  if (c >= 'A' && c <= 'F') return 10 + (c - 'A');
+  return -1;
+}
+
+static bool parseMacString(const String &text, uint8_t out[6]) {
+  if (out == nullptr) return false;
+  if (text.length() != 17) return false;
+  for (int i = 0; i < 6; ++i) {
+    int base = i * 3;
+    int hi = parseHexNibble(text[base]);
+    int lo = parseHexNibble(text[base + 1]);
+    if (hi < 0 || lo < 0) return false;
+    if (i < 5 && text[base + 2] != ':') return false;
+    out[i] = (uint8_t)((hi << 4) | lo);
+  }
+  return true;
+}
+
+static bool parseQrBool(const String &value) {
+  String normalized = value;
+  normalized.toLowerCase();
+  normalized.trim();
+  return normalized == "1" || normalized == "true" || normalized == "t" ||
+         normalized == "yes" || normalized == "y";
 }
 
 static Status copyApiFile(const String &srcApiPath,
@@ -2379,6 +2443,929 @@ Status StorageService::writeCsv(const String &fileNameOrPath,
                                 const String &csv,
                                 const String &dirOverride) {
   return writeTextFile(fileNameOrPath, csv, dirOverride);
+}
+
+Status ConnectivityService::lockState() const {
+  if (!stateMutex_) {
+    return Status::Error(StatusCode::IOError, "wifi mutex unavailable");
+  }
+  if (xSemaphoreTake(stateMutex_, pdMS_TO_TICKS(500)) != pdTRUE) {
+    return Status::Error(StatusCode::Busy, "wifi state busy");
+  }
+  return Status::OkStatus();
+}
+
+void ConnectivityService::unlockState() const {
+  if (stateMutex_) {
+    xSemaphoreGive(stateMutex_);
+  }
+}
+
+Status ConnectivityService::ensureWifiStartedLocked() {
+  if (wifiStarted_) {
+    return Status::OkStatus();
+  }
+
+  WiFi.mode(WIFI_STA);
+  WiFi.persistent(false);
+  WiFi.setSleep(false);
+  WiFi.setAutoReconnect(autoReconnectEnabled_);
+  wifiStarted_ = true;
+
+  return loadProfilesFromPrefsLocked();
+}
+
+void ConnectivityService::compactProfilesLocked() {
+  size_t write = 0;
+  for (size_t i = 0; i < profileCount_; ++i) {
+    if (profiles_[i].ssid.length() == 0) continue;
+    if (write != i) {
+      profiles_[write] = profiles_[i];
+    }
+    ++write;
+  }
+  profileCount_ = write;
+  if (lastConnectedIndex_ >= (int)profileCount_) {
+    lastConnectedIndex_ = profileCount_ > 0 ? 0 : -1;
+  }
+}
+
+int ConnectivityService::findProfileIndexBySsidLocked(const String &ssid) const {
+  String key = normalizeSsidKey(ssid);
+  for (size_t i = 0; i < profileCount_; ++i) {
+    if (normalizeSsidKey(profiles_[i].ssid) == key) {
+      return (int)i;
+    }
+  }
+  return -1;
+}
+
+Status ConnectivityService::loadProfilesFromPrefsLocked() {
+  if (profilesLoaded_) {
+    return Status::OkStatus();
+  }
+
+  profileCount_ = 0;
+  lastConnectedIndex_ = -1;
+
+  Preferences prefs;
+  if (!prefs.begin(kPrefsNamespace, true)) {
+    return Status::Error(StatusCode::IOError, "failed to open wifi preferences");
+  }
+
+  size_t savedCount = (size_t)prefs.getUInt("count", 0);
+  if (savedCount > kMaxProfiles) {
+    savedCount = kMaxProfiles;
+  }
+
+  lastConnectedIndex_ = prefs.getInt("last", -1);
+
+  for (size_t i = 0; i < savedCount; ++i) {
+    char key[12];
+
+    snprintf(key, sizeof(key), "s%u", (unsigned)i);
+    String ssid = prefs.getString(key, "");
+    ssid.trim();
+    if (ssid.length() == 0) {
+      continue;
+    }
+
+    if (profileCount_ >= kMaxProfiles) {
+      break;
+    }
+
+    KnownProfile &p = profiles_[profileCount_++];
+    p = KnownProfile();
+    p.ssid = ssid;
+
+    snprintf(key, sizeof(key), "p%u", (unsigned)i);
+    p.password = prefs.getString(key, "");
+
+    snprintf(key, sizeof(key), "c%u", (unsigned)i);
+    p.channel = (uint8_t)prefs.getUChar(key, 0);
+
+    snprintf(key, sizeof(key), "b%u", (unsigned)i);
+    String bssidText = prefs.getString(key, "");
+    p.hasBssid = parseMacString(bssidText, p.bssid);
+
+    snprintf(key, sizeof(key), "u%u", (unsigned)i);
+    p.successCount = prefs.getUInt(key, 0);
+
+    snprintf(key, sizeof(key), "r%u", (unsigned)i);
+    p.lastRssi = prefs.getInt(key, -127);
+  }
+
+  prefs.end();
+
+  compactProfilesLocked();
+  if (lastConnectedIndex_ < 0 || lastConnectedIndex_ >= (int)profileCount_) {
+    lastConnectedIndex_ = profileCount_ > 0 ? 0 : -1;
+  }
+
+  profilesLoaded_ = true;
+  return Status::OkStatus();
+}
+
+Status ConnectivityService::saveProfilesToPrefsLocked() {
+  Preferences prefs;
+  if (!prefs.begin(kPrefsNamespace, false)) {
+    return Status::Error(StatusCode::IOError, "failed to write wifi preferences");
+  }
+
+  prefs.clear();
+  prefs.putUInt("count", (uint32_t)profileCount_);
+  prefs.putInt("last", lastConnectedIndex_);
+
+  for (size_t i = 0; i < profileCount_; ++i) {
+    const KnownProfile &p = profiles_[i];
+    char key[12];
+
+    snprintf(key, sizeof(key), "s%u", (unsigned)i);
+    prefs.putString(key, p.ssid);
+
+    snprintf(key, sizeof(key), "p%u", (unsigned)i);
+    prefs.putString(key, p.password);
+
+    snprintf(key, sizeof(key), "c%u", (unsigned)i);
+    prefs.putUChar(key, p.channel);
+
+    snprintf(key, sizeof(key), "b%u", (unsigned)i);
+    prefs.putString(key, p.hasBssid ? wifiMacToString(p.bssid) : String(""));
+
+    snprintf(key, sizeof(key), "u%u", (unsigned)i);
+    prefs.putUInt(key, p.successCount);
+
+    snprintf(key, sizeof(key), "r%u", (unsigned)i);
+    prefs.putInt(key, p.lastRssi);
+  }
+
+  prefs.end();
+  return Status::OkStatus();
+}
+
+void ConnectivityService::recordSuccessfulConnectLocked(int profileIndex,
+                                                        int32_t rssi,
+                                                        uint8_t channel,
+                                                        const uint8_t *bssid) {
+  connectedSinceMs_ = millis();
+  if (successfulConnectCount_ > 0) {
+    reconnectCount_++;
+  }
+  successfulConnectCount_++;
+
+  if (profileIndex < 0 || profileIndex >= (int)profileCount_) {
+    return;
+  }
+
+  KnownProfile &p = profiles_[(size_t)profileIndex];
+  p.successCount++;
+  p.lastRssi = rssi;
+  if (channel > 0) {
+    p.channel = channel;
+  }
+  if (bssid != nullptr) {
+    memcpy(p.bssid, bssid, sizeof(p.bssid));
+    p.hasBssid = true;
+  }
+  lastConnectedIndex_ = profileIndex;
+}
+
+Status ConnectivityService::attemptConnectLocked(const String &ssid,
+                                                 const String &password,
+                                                 uint32_t timeoutMs,
+                                                 uint8_t channelHint,
+                                                 const uint8_t *bssidHint,
+                                                 bool useHints) {
+  if (ssid.length() == 0) {
+    return Status::Error(StatusCode::InvalidArgument, "wifi ssid is empty");
+  }
+
+  WiFi.mode(WIFI_STA);
+  WiFi.disconnect(false, false);
+  delay(40);
+
+  if (useHints && channelHint > 0 && bssidHint != nullptr) {
+    WiFi.begin(ssid.c_str(), password.c_str(), channelHint, bssidHint, true);
+  } else {
+    WiFi.begin(ssid.c_str(), password.c_str());
+  }
+
+  if (timeoutMs < 1500) {
+    timeoutMs = 1500;
+  }
+
+  uint32_t deadline = millis() + timeoutMs;
+  wl_status_t st = WL_IDLE_STATUS;
+  while ((int32_t)(deadline - millis()) > 0) {
+    st = WiFi.status();
+    if (st == WL_CONNECTED) {
+      return Status::OkStatus();
+    }
+
+    if (st == WL_CONNECT_FAILED ||
+        st == WL_NO_SSID_AVAIL ||
+        st == WL_CONNECTION_LOST) {
+      break;
+    }
+    delay(120);
+  }
+
+  st = WiFi.status();
+  if (st == WL_CONNECTED) {
+    return Status::OkStatus();
+  }
+  if (st == WL_NO_SSID_AVAIL) {
+    return Status::Error(StatusCode::IOError, "wifi ssid unavailable");
+  }
+  if (st == WL_CONNECT_FAILED) {
+    return Status::Error(StatusCode::IOError, "wifi connect failed");
+  }
+  return Status::Error(StatusCode::IOError, "wifi connect timeout");
+}
+
+Status ConnectivityService::connectProfileIndexLocked(int profileIndex,
+                                                      const WifiConnectOptions &options,
+                                                      uint8_t channelHint,
+                                                      const uint8_t *bssidHint,
+                                                      bool allowHintOverride) {
+  if (profileIndex < 0 || profileIndex >= (int)profileCount_) {
+    return Status::Error(StatusCode::InvalidArgument, "invalid wifi profile index");
+  }
+
+  const KnownProfile &p = profiles_[(size_t)profileIndex];
+  uint8_t effectiveChannel = 0;
+  const uint8_t *effectiveBssid = nullptr;
+  bool useHints = false;
+
+  if (allowHintOverride && channelHint > 0 && bssidHint != nullptr) {
+    effectiveChannel = channelHint;
+    effectiveBssid = bssidHint;
+    useHints = true;
+  } else if (options.useStoredRadioHints && p.channel > 0 && p.hasBssid) {
+    effectiveChannel = p.channel;
+    effectiveBssid = p.bssid;
+    useHints = true;
+  }
+
+  Status st = attemptConnectLocked(p.ssid,
+                                   p.password,
+                                   options.timeoutMs,
+                                   effectiveChannel,
+                                   effectiveBssid,
+                                   useHints);
+  if (!st.ok()) {
+    return st;
+  }
+
+  const uint8_t *connectedBssid = WiFi.BSSID();
+  recordSuccessfulConnectLocked(profileIndex,
+                                WiFi.RSSI(),
+                                (uint8_t)WiFi.channel(),
+                                connectedBssid);
+  return Status::OkStatus();
+}
+
+Status ConnectivityService::begin(bool autoReconnect) {
+  Status st = lockState();
+  if (!st.ok()) return st;
+
+  autoReconnectEnabled_ = autoReconnect;
+  st = ensureWifiStartedLocked();
+
+  unlockState();
+  return st;
+}
+
+Status ConnectivityService::setAutoReconnect(bool enabled) {
+  Status st = lockState();
+  if (!st.ok()) return st;
+
+  autoReconnectEnabled_ = enabled;
+  if (wifiStarted_) {
+    WiFi.setAutoReconnect(enabled);
+  }
+
+  unlockState();
+  return Status::OkStatus();
+}
+
+Status ConnectivityService::addKnownNetwork(const String &ssid,
+                                            const String &password) {
+  String cleanSsid = trimCopy(ssid);
+  if (cleanSsid.length() == 0) {
+    return Status::Error(StatusCode::InvalidArgument, "wifi ssid is empty");
+  }
+
+  Status st = lockState();
+  if (!st.ok()) return st;
+
+  st = ensureWifiStartedLocked();
+  if (!st.ok()) {
+    unlockState();
+    return st;
+  }
+
+  int idx = findProfileIndexBySsidLocked(cleanSsid);
+  if (idx < 0) {
+    if (profileCount_ < kMaxProfiles) {
+      idx = (int)profileCount_;
+      profiles_[profileCount_++] = KnownProfile();
+    } else {
+      size_t worst = 0;
+      for (size_t i = 1; i < profileCount_; ++i) {
+        if (profiles_[i].successCount < profiles_[worst].successCount) {
+          worst = i;
+        }
+      }
+      idx = (int)worst;
+      profiles_[worst] = KnownProfile();
+    }
+  }
+
+  profiles_[(size_t)idx].ssid = cleanSsid;
+  profiles_[(size_t)idx].password = password;
+
+  st = saveProfilesToPrefsLocked();
+  unlockState();
+  return st;
+}
+
+Status ConnectivityService::removeKnownNetwork(const String &ssid) {
+  String cleanSsid = trimCopy(ssid);
+  if (cleanSsid.length() == 0) {
+    return Status::Error(StatusCode::InvalidArgument, "wifi ssid is empty");
+  }
+
+  Status st = lockState();
+  if (!st.ok()) return st;
+
+  st = ensureWifiStartedLocked();
+  if (!st.ok()) {
+    unlockState();
+    return st;
+  }
+
+  int idx = findProfileIndexBySsidLocked(cleanSsid);
+  if (idx < 0) {
+    unlockState();
+    return Status::Error(StatusCode::InvalidArgument, "wifi profile not found");
+  }
+
+  for (size_t i = (size_t)idx; i + 1 < profileCount_; ++i) {
+    profiles_[i] = profiles_[i + 1];
+  }
+  if (profileCount_ > 0) {
+    profileCount_--;
+  }
+
+  compactProfilesLocked();
+  st = saveProfilesToPrefsLocked();
+
+  unlockState();
+  return st;
+}
+
+Status ConnectivityService::clearKnownNetworks() {
+  Status st = lockState();
+  if (!st.ok()) return st;
+
+  st = ensureWifiStartedLocked();
+  if (!st.ok()) {
+    unlockState();
+    return st;
+  }
+
+  for (size_t i = 0; i < kMaxProfiles; ++i) {
+    profiles_[i] = KnownProfile();
+  }
+  profileCount_ = 0;
+  lastConnectedIndex_ = -1;
+
+  st = saveProfilesToPrefsLocked();
+  unlockState();
+  return st;
+}
+
+Status ConnectivityService::connect(const String &ssid,
+                                    const String &password,
+                                    const WifiConnectOptions &options) {
+  String cleanSsid = trimCopy(ssid);
+  if (cleanSsid.length() == 0) {
+    return Status::Error(StatusCode::InvalidArgument, "wifi ssid is empty");
+  }
+
+  Status st = lockState();
+  if (!st.ok()) return st;
+
+  st = ensureWifiStartedLocked();
+  if (!st.ok()) {
+    unlockState();
+    return st;
+  }
+
+  int idx = findProfileIndexBySsidLocked(cleanSsid);
+  uint8_t channelHint = 0;
+  const uint8_t *bssidHint = nullptr;
+  if (options.useStoredRadioHints && idx >= 0) {
+    const KnownProfile &p = profiles_[(size_t)idx];
+    if (p.channel > 0 && p.hasBssid) {
+      channelHint = p.channel;
+      bssidHint = p.bssid;
+    }
+  }
+
+  st = attemptConnectLocked(cleanSsid,
+                            password,
+                            options.timeoutMs,
+                            channelHint,
+                            bssidHint,
+                            bssidHint != nullptr);
+  if (!st.ok()) {
+    unlockState();
+    return st;
+  }
+
+  const uint8_t *connectedBssid = WiFi.BSSID();
+  uint8_t connectedChannel = (uint8_t)WiFi.channel();
+  int32_t connectedRssi = WiFi.RSSI();
+
+  if (options.persistOnSuccess) {
+    if (idx < 0) {
+      if (profileCount_ < kMaxProfiles) {
+        idx = (int)profileCount_;
+        profiles_[profileCount_++] = KnownProfile();
+      } else {
+        size_t worst = 0;
+        for (size_t i = 1; i < profileCount_; ++i) {
+          if (profiles_[i].successCount < profiles_[worst].successCount) {
+            worst = i;
+          }
+        }
+        idx = (int)worst;
+        profiles_[worst] = KnownProfile();
+      }
+    }
+
+    KnownProfile &p = profiles_[(size_t)idx];
+    p.ssid = cleanSsid;
+    p.password = password;
+    recordSuccessfulConnectLocked(idx, connectedRssi, connectedChannel, connectedBssid);
+
+    Status saveSt = saveProfilesToPrefsLocked();
+    if (!saveSt.ok()) {
+      USBSerial.printf("wifi.warn: %s\n", saveSt.message);
+    }
+  } else {
+    connectedSinceMs_ = millis();
+    if (successfulConnectCount_ > 0) reconnectCount_++;
+    successfulConnectCount_++;
+  }
+
+  unlockState();
+  return Status::OkStatus();
+}
+
+Status ConnectivityService::connectKnown(const WifiConnectOptions &options) {
+  Status st = lockState();
+  if (!st.ok()) return st;
+
+  st = ensureWifiStartedLocked();
+  if (!st.ok()) {
+    unlockState();
+    return st;
+  }
+
+  if (profileCount_ == 0) {
+    unlockState();
+    return Status::Error(StatusCode::NotInitialized, "no known wifi profiles");
+  }
+
+  int order[kMaxProfiles];
+  bool used[kMaxProfiles];
+  for (size_t i = 0; i < kMaxProfiles; ++i) {
+    used[i] = false;
+    order[i] = -1;
+  }
+
+  size_t orderCount = 0;
+  if (lastConnectedIndex_ >= 0 && lastConnectedIndex_ < (int)profileCount_) {
+    order[orderCount++] = lastConnectedIndex_;
+    used[(size_t)lastConnectedIndex_] = true;
+  }
+
+  while (orderCount < profileCount_) {
+    int best = -1;
+    for (size_t i = 0; i < profileCount_; ++i) {
+      if (used[i]) continue;
+      if (best < 0) {
+        best = (int)i;
+        continue;
+      }
+      const KnownProfile &a = profiles_[i];
+      const KnownProfile &b = profiles_[(size_t)best];
+      if (a.successCount > b.successCount ||
+          (a.successCount == b.successCount && a.lastRssi > b.lastRssi)) {
+        best = (int)i;
+      }
+    }
+    if (best < 0) break;
+    used[(size_t)best] = true;
+    order[orderCount++] = best;
+  }
+
+  for (size_t i = 0; i < orderCount; ++i) {
+    int idx = order[i];
+    st = connectProfileIndexLocked(idx, options, 0, nullptr, false);
+    if (st.ok()) {
+      Status saveSt = saveProfilesToPrefsLocked();
+      if (!saveSt.ok()) {
+        USBSerial.printf("wifi.warn: %s\n", saveSt.message);
+      }
+      unlockState();
+      return Status::OkStatus();
+    }
+  }
+
+  if (!options.allowScanFallback) {
+    unlockState();
+    return Status::Error(StatusCode::IOError, "known wifi profiles failed");
+  }
+
+  struct ScanCandidate {
+    bool found = false;
+    int32_t rssi = -127;
+    uint8_t channel = 0;
+    uint8_t bssid[6] = {0, 0, 0, 0, 0, 0};
+    bool hasBssid = false;
+  };
+
+  ScanCandidate candidates[kMaxProfiles];
+
+  int found = WiFi.scanNetworks(false, true, false, 120, 0);
+  if (found < 0) {
+    unlockState();
+    return Status::Error(StatusCode::IOError, "wifi scan failed");
+  }
+
+  for (int i = 0; i < found; ++i) {
+    String scannedSsid = WiFi.SSID(i);
+    String scannedKey = normalizeSsidKey(scannedSsid);
+    int32_t scannedRssi = WiFi.RSSI(i);
+
+    for (size_t p = 0; p < profileCount_; ++p) {
+      if (normalizeSsidKey(profiles_[p].ssid) != scannedKey) continue;
+      if (!candidates[p].found || scannedRssi > candidates[p].rssi) {
+        candidates[p].found = true;
+        candidates[p].rssi = scannedRssi;
+        candidates[p].channel = (uint8_t)WiFi.channel(i);
+        const uint8_t *scanBssid = WiFi.BSSID(i);
+        if (scanBssid != nullptr) {
+          memcpy(candidates[p].bssid, scanBssid, sizeof(candidates[p].bssid));
+          candidates[p].hasBssid = true;
+        } else {
+          candidates[p].hasBssid = false;
+        }
+      }
+    }
+  }
+  WiFi.scanDelete();
+
+  int matched[kMaxProfiles];
+  size_t matchedCount = 0;
+  for (size_t i = 0; i < profileCount_; ++i) {
+    if (candidates[i].found) {
+      matched[matchedCount++] = (int)i;
+    }
+  }
+
+  for (size_t i = 0; i < matchedCount; ++i) {
+    for (size_t j = i + 1; j < matchedCount; ++j) {
+      int ia = matched[i];
+      int ib = matched[j];
+      if (candidates[(size_t)ib].rssi > candidates[(size_t)ia].rssi) {
+        int tmp = matched[i];
+        matched[i] = matched[j];
+        matched[j] = tmp;
+      }
+    }
+  }
+
+  for (size_t i = 0; i < matchedCount; ++i) {
+    int idx = matched[i];
+    const uint8_t *hintBssid = candidates[(size_t)idx].hasBssid
+                                   ? candidates[(size_t)idx].bssid
+                                   : nullptr;
+
+    st = connectProfileIndexLocked(idx,
+                                   options,
+                                   candidates[(size_t)idx].channel,
+                                   hintBssid,
+                                   true);
+    if (st.ok()) {
+      Status saveSt = saveProfilesToPrefsLocked();
+      if (!saveSt.ok()) {
+        USBSerial.printf("wifi.warn: %s\n", saveSt.message);
+      }
+      unlockState();
+      return Status::OkStatus();
+    }
+  }
+
+  unlockState();
+  return Status::Error(StatusCode::IOError, "failed to connect known wifi profiles");
+}
+
+Status ConnectivityService::disconnect(bool eraseConfig) {
+  Status st = lockState();
+  if (!st.ok()) return st;
+
+  st = ensureWifiStartedLocked();
+  if (!st.ok()) {
+    unlockState();
+    return st;
+  }
+
+  WiFi.disconnect(false, eraseConfig);
+  connectedSinceMs_ = 0;
+
+  unlockState();
+  return Status::OkStatus();
+}
+
+bool ConnectivityService::connected() const { return WiFi.status() == WL_CONNECTED; }
+
+String ConnectivityService::ssid() const { return WiFi.SSID(); }
+
+String ConnectivityService::bssid() const { return WiFi.BSSIDstr(); }
+
+int32_t ConnectivityService::rssi() const { return WiFi.RSSI(); }
+
+String ConnectivityService::localIp() const { return WiFi.localIP().toString(); }
+
+String ConnectivityService::gatewayIp() const { return WiFi.gatewayIP().toString(); }
+
+String ConnectivityService::subnetMask() const { return WiFi.subnetMask().toString(); }
+
+String ConnectivityService::dnsIp(uint8_t index) const {
+  if (index == 0) {
+    return WiFi.dnsIP(0).toString();
+  }
+  return WiFi.dnsIP(1).toString();
+}
+
+Status ConnectivityService::scan(WifiScanResult *outEntries,
+                                 size_t capacity,
+                                 size_t *outCount,
+                                 bool showHidden,
+                                 bool passive,
+                                 uint32_t maxMsPerChan) {
+  if (outCount == nullptr) {
+    return Status::Error(StatusCode::InvalidArgument, "outCount is null");
+  }
+  if (outEntries == nullptr && capacity > 0) {
+    return Status::Error(StatusCode::InvalidArgument, "scan buffer is null");
+  }
+
+  Status st = lockState();
+  if (!st.ok()) return st;
+
+  st = ensureWifiStartedLocked();
+  if (!st.ok()) {
+    unlockState();
+    return st;
+  }
+
+  int found = WiFi.scanNetworks(false, showHidden, passive, maxMsPerChan, 0);
+  if (found < 0) {
+    unlockState();
+    return Status::Error(StatusCode::IOError, "wifi scan failed");
+  }
+
+  size_t total = (size_t)found;
+  size_t copyCount = capacity < total ? capacity : total;
+  for (size_t i = 0; i < copyCount; ++i) {
+    outEntries[i].ssid = WiFi.SSID((int)i);
+    outEntries[i].bssid = WiFi.BSSIDstr((int)i);
+    outEntries[i].rssi = WiFi.RSSI((int)i);
+    outEntries[i].channel = (uint8_t)WiFi.channel((int)i);
+    outEntries[i].encryption = (uint8_t)WiFi.encryptionType((int)i);
+    outEntries[i].hidden = outEntries[i].ssid.length() == 0;
+  }
+
+  *outCount = total;
+  WiFi.scanDelete();
+
+  unlockState();
+  return Status::OkStatus();
+}
+
+Status ConnectivityService::analyzeEnvironment(String *outReport,
+                                               size_t topN,
+                                               bool showHidden) {
+  if (outReport == nullptr) {
+    return Status::Error(StatusCode::InvalidArgument, "outReport is null");
+  }
+
+  WifiScanResult scratch[kScanScratchCapacity];
+  size_t totalFound = 0;
+  Status st = scan(scratch,
+                   kScanScratchCapacity,
+                   &totalFound,
+                   showHidden,
+                   false,
+                   120);
+  if (!st.ok()) return st;
+
+  size_t available = totalFound;
+  if (available > kScanScratchCapacity) {
+    available = kScanScratchCapacity;
+  }
+
+  uint16_t channels[14] = {0};
+  for (size_t i = 0; i < available; ++i) {
+    uint8_t ch = scratch[i].channel;
+    if (ch >= 1 && ch <= 13) {
+      channels[ch]++;
+    }
+  }
+
+  uint8_t bestChannel = 1;
+  uint16_t bestLoad = channels[1];
+  for (uint8_t ch = 2; ch <= 13; ++ch) {
+    if (channels[ch] < bestLoad) {
+      bestLoad = channels[ch];
+      bestChannel = ch;
+    }
+  }
+
+  if (topN > available) {
+    topN = available;
+  }
+  for (size_t i = 0; i < topN; ++i) {
+    for (size_t j = i + 1; j < available; ++j) {
+      if (scratch[j].rssi > scratch[i].rssi) {
+        WifiScanResult tmp = scratch[i];
+        scratch[i] = scratch[j];
+        scratch[j] = tmp;
+      }
+    }
+  }
+
+  String report;
+  report.reserve(768);
+  report += "wifi analysis\n";
+  report += String("visible=") + String((unsigned long)totalFound);
+  report += String(" sampled=") + String((unsigned long)available) + "\n";
+  report += String("bestChannel=") + String((unsigned long)bestChannel);
+  report += String(" load=") + String((unsigned long)bestLoad) + "\n";
+
+  if (connected()) {
+    report += String("connected=") + ssid();
+    report += String(" rssi=") + String((long)rssi());
+    report += String(" quality=") + String((unsigned long)rssiToQuality(rssi()));
+    report += "%\n";
+  } else {
+    report += "connected=no\n";
+  }
+
+  report += "top:\n";
+  for (size_t i = 0; i < topN; ++i) {
+    const WifiScanResult &e = scratch[i];
+    report += String("  ") + String((unsigned long)(i + 1));
+    report += ") ";
+    report += e.ssid.length() > 0 ? e.ssid : String("<hidden>");
+    report += String(" rssi=") + String((long)e.rssi);
+    report += String(" ch=") + String((unsigned long)e.channel);
+    report += String(" enc=") + String((unsigned long)e.encryption) + "\n";
+  }
+
+  *outReport = report;
+  return Status::OkStatus();
+}
+
+Status ConnectivityService::parseWifiQrPayload(const String &payload,
+                                               String *outSsid,
+                                               String *outPassword,
+                                               bool *outHidden) const {
+  if (outSsid == nullptr || outPassword == nullptr) {
+    return Status::Error(StatusCode::InvalidArgument, "wifi qr output is null");
+  }
+
+  String text = trimCopy(payload);
+  if (!text.startsWith("WIFI:")) {
+    return Status::Error(StatusCode::InvalidArgument, "qr payload is not WIFI format");
+  }
+
+  String body = text.substring(5);
+  body += ';';
+
+  String ssidValue;
+  String passValue;
+  String authType;
+  bool hiddenValue = false;
+
+  String token;
+  bool escaping = false;
+  for (size_t i = 0; i < body.length(); ++i) {
+    char c = body[i];
+    if (escaping) {
+      token += c;
+      escaping = false;
+      continue;
+    }
+    if (c == '\\') {
+      escaping = true;
+      continue;
+    }
+    if (c != ';') {
+      token += c;
+      continue;
+    }
+
+    if (token.length() >= 3 && token[1] == ':') {
+      char key = token[0];
+      String value = token.substring(2);
+      if (key == 'S') {
+        ssidValue = value;
+      } else if (key == 'P') {
+        passValue = value;
+      } else if (key == 'T') {
+        authType = value;
+      } else if (key == 'H') {
+        hiddenValue = parseQrBool(value);
+      }
+    }
+    token = "";
+  }
+
+  if (ssidValue.length() == 0) {
+    return Status::Error(StatusCode::InvalidArgument, "wifi qr missing SSID");
+  }
+
+  String auth = authType;
+  auth.toUpperCase();
+  auth.trim();
+  if (auth == "NOPASS") {
+    passValue = "";
+  }
+
+  *outSsid = ssidValue;
+  *outPassword = passValue;
+  if (outHidden != nullptr) {
+    *outHidden = hiddenValue;
+  }
+  return Status::OkStatus();
+}
+
+Status ConnectivityService::connectFromQrPayload(const String &payload,
+                                                 const WifiConnectOptions &options) {
+  String ssidValue;
+  String passValue;
+  bool hidden = false;
+  Status st = parseWifiQrPayload(payload, &ssidValue, &passValue, &hidden);
+  if (!st.ok()) return st;
+
+  (void)hidden;
+  return connect(ssidValue, passValue, options);
+}
+
+Status ConnectivityService::connectFromVisionQr(VisionService &vision,
+                                                const WifiConnectOptions &options) {
+  String payload = vision.qrPayload();
+  payload.trim();
+  if (payload.length() == 0) {
+    return Status::Error(StatusCode::NotInitialized, "vision qr payload empty");
+  }
+  return connectFromQrPayload(payload, options);
+}
+
+Status ConnectivityService::linkStats(WifiLinkStats &out) const {
+  out = WifiLinkStats();
+
+  Status st = lockState();
+  if (!st.ok()) return st;
+  out.knownProfiles = profileCount_;
+  out.reconnectCount = reconnectCount_;
+  out.connectedSinceMs = connectedSinceMs_;
+  unlockState();
+
+  out.connected = connected();
+  if (!out.connected) {
+    return Status::OkStatus();
+  }
+
+  out.ssid = ssid();
+  out.bssid = bssid();
+  out.rssi = rssi();
+  out.channel = (uint8_t)WiFi.channel();
+  out.qualityPercent = rssiToQuality(out.rssi);
+  out.localIp = localIp();
+  out.gatewayIp = gatewayIp();
+  out.subnetMask = subnetMask();
+  out.dns1 = dnsIp(0);
+  out.dns2 = dnsIp(1);
+
+  return Status::OkStatus();
 }
 
 Status AudioService::lockState() {

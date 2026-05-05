@@ -12,6 +12,8 @@
 
 namespace unihiker_pro {
 
+class VisionService;
+
 class DisplayService {
  public:
   explicit DisplayService(IBoardHal &hal)
@@ -237,6 +239,39 @@ struct StorageHealth {
   bool readWriteOk = false;
   uint64_t totalBytes = 0;
   uint64_t usedBytes = 0;
+};
+
+struct WifiConnectOptions {
+  uint32_t timeoutMs = 12000;
+  bool allowScanFallback = true;
+  bool useStoredRadioHints = true;
+  bool persistOnSuccess = true;
+};
+
+struct WifiScanResult {
+  String ssid;
+  String bssid;
+  int32_t rssi = -127;
+  uint8_t channel = 0;
+  uint8_t encryption = 0;
+  bool hidden = false;
+};
+
+struct WifiLinkStats {
+  bool connected = false;
+  String ssid;
+  String bssid;
+  int32_t rssi = -127;
+  uint8_t channel = 0;
+  uint8_t qualityPercent = 0;
+  String localIp;
+  String gatewayIp;
+  String subnetMask;
+  String dns1;
+  String dns2;
+  uint32_t connectedSinceMs = 0;
+  uint32_t reconnectCount = 0;
+  size_t knownProfiles = 0;
 };
 
 enum class SpeechProfile {
@@ -486,6 +521,115 @@ class StorageService {
   uint32_t wavSampleRate_;
   uint16_t wavChannels_;
   uint16_t wavBitsPerSample_;
+};
+
+class ConnectivityService {
+ public:
+  ConnectivityService()
+      : stateMutex_(xSemaphoreCreateMutex()),
+        wifiStarted_(false),
+        autoReconnectEnabled_(true),
+        connectedSinceMs_(0),
+        reconnectCount_(0),
+        successfulConnectCount_(0),
+        profileCount_(0),
+        lastConnectedIndex_(-1),
+        profilesLoaded_(false) {}
+
+  Status begin(bool autoReconnect = true);
+  Status setAutoReconnect(bool enabled);
+  bool autoReconnectEnabled() const { return autoReconnectEnabled_; }
+
+  Status addKnownNetwork(const String &ssid, const String &password);
+  Status removeKnownNetwork(const String &ssid);
+  Status clearKnownNetworks();
+  size_t knownNetworkCount() const { return profileCount_; }
+
+  Status connect(const String &ssid,
+                 const String &password,
+                 const WifiConnectOptions &options = WifiConnectOptions());
+  Status connectKnown(const WifiConnectOptions &options = WifiConnectOptions());
+  Status disconnect(bool eraseConfig = false);
+
+  bool connected() const;
+  String ssid() const;
+  String bssid() const;
+  int32_t rssi() const;
+  String localIp() const;
+  String gatewayIp() const;
+  String subnetMask() const;
+  String dnsIp(uint8_t index = 0) const;
+
+  Status scan(WifiScanResult *outEntries,
+              size_t capacity,
+              size_t *outCount,
+              bool showHidden = true,
+              bool passive = false,
+              uint32_t maxMsPerChan = 120);
+
+  Status analyzeEnvironment(String *outReport,
+                            size_t topN = 8,
+                            bool showHidden = true);
+
+  Status parseWifiQrPayload(const String &payload,
+                            String *outSsid,
+                            String *outPassword,
+                            bool *outHidden = nullptr) const;
+  Status connectFromQrPayload(const String &payload,
+                              const WifiConnectOptions &options = WifiConnectOptions());
+  Status connectFromVisionQr(VisionService &vision,
+                             const WifiConnectOptions &options = WifiConnectOptions());
+
+  Status linkStats(WifiLinkStats &out) const;
+
+ private:
+  struct KnownProfile {
+    String ssid;
+    String password;
+    uint8_t channel = 0;
+    uint8_t bssid[6] = {0, 0, 0, 0, 0, 0};
+    bool hasBssid = false;
+    uint32_t successCount = 0;
+    int32_t lastRssi = -127;
+  };
+
+  static constexpr size_t kMaxProfiles = 8;
+  static constexpr size_t kScanScratchCapacity = 24;
+  static constexpr const char *kPrefsNamespace = "wifi_sdk";
+
+  Status lockState() const;
+  void unlockState() const;
+  Status ensureWifiStartedLocked();
+  Status loadProfilesFromPrefsLocked();
+  Status saveProfilesToPrefsLocked();
+  int findProfileIndexBySsidLocked(const String &ssid) const;
+  void compactProfilesLocked();
+  void recordSuccessfulConnectLocked(int profileIndex,
+                                     int32_t rssi,
+                                     uint8_t channel,
+                                     const uint8_t *bssid);
+  Status attemptConnectLocked(const String &ssid,
+                              const String &password,
+                              uint32_t timeoutMs,
+                              uint8_t channelHint,
+                              const uint8_t *bssidHint,
+                              bool useHints);
+  Status connectProfileIndexLocked(int profileIndex,
+                                   const WifiConnectOptions &options,
+                                   uint8_t channelHint,
+                                   const uint8_t *bssidHint,
+                                   bool allowHintOverride);
+
+  SemaphoreHandle_t stateMutex_;
+  bool wifiStarted_;
+  bool autoReconnectEnabled_;
+  uint32_t connectedSinceMs_;
+  uint32_t reconnectCount_;
+  uint32_t successfulConnectCount_;
+  KnownProfile profiles_[kMaxProfiles];
+  size_t profileCount_;
+  int lastConnectedIndex_;
+  bool profilesLoaded_;
 };
 
 class AudioService {

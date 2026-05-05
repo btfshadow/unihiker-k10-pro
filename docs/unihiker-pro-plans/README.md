@@ -19,6 +19,8 @@ Planos de migração da SDK para arquitetura multi-camadas.
 14. `plan-14-optimize.md`
 
 ## Proximos planos nao executados (fila sugerida)
+1. `plan-11-compatibility-and-release.md`
+2. `plan-12-input-navigation.md`
+
+## Plano ativo
 1. `plan-10-connectivity.md`
-2. `plan-11-compatibility-and-release.md`
-3. `plan-12-input-navigation.md`
