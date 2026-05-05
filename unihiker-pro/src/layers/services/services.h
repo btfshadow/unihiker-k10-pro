@@ -10,6 +10,8 @@
 #include <freertos/semphr.h>
 #include <unihiker_k10.h>
 
+class WebServer;
+
 namespace unihiker_pro {
 
 class VisionService;
@@ -272,6 +274,45 @@ struct WifiLinkStats {
   uint32_t connectedSinceMs = 0;
   uint32_t reconnectCount = 0;
   size_t knownProfiles = 0;
+};
+
+struct WifiContextSnapshot {
+  bool connected = false;
+  uint8_t statusCode = 0;
+  String ssid;
+  String bssid;
+  String localIp;
+  String gatewayIp;
+  String subnetMask;
+  String dns1;
+  String dns2;
+  String stationMac;
+  int32_t rssi = -127;
+  uint8_t qualityPercent = 0;
+  uint8_t channel = 0;
+  uint32_t connectedSinceMs = 0;
+  uint32_t reconnectCount = 0;
+  uint32_t successfulConnectCount = 0;
+  size_t knownProfiles = 0;
+  uint32_t updatedAtMs = 0;
+};
+
+struct MdnsLinkStats {
+  bool running = false;
+  String host;
+  String instance;
+  String service;
+  String proto;
+  uint16_t port = 0;
+  uint32_t startedAtMs = 0;
+};
+
+struct HttpServerStats {
+  bool running = false;
+  uint16_t port = 0;
+  uint32_t startedAtMs = 0;
+  uint32_t requestCount = 0;
+  bool exposeAnalysis = true;
 };
 
 enum class SpeechProfile {
@@ -579,8 +620,30 @@ class ConnectivityService {
                               const WifiConnectOptions &options = WifiConnectOptions());
   Status connectFromVisionQr(VisionService &vision,
                              const WifiConnectOptions &options = WifiConnectOptions());
+  Status waitAndConnectFromVisionQr(VisionService &vision,
+                                    const WifiConnectOptions &options = WifiConnectOptions(),
+                                    uint32_t timeoutMs = 30000,
+                                    uint32_t pollMs = 180,
+                                    String *outPayload = nullptr);
 
+  Status wifiContext(WifiContextSnapshot &out, bool refresh = true) const;
   Status linkStats(WifiLinkStats &out) const;
+
+  Status startMdns(const String &host,
+                   const String &instance = "unihiker-pro",
+                   const String &service = "unihiker",
+                   const String &proto = "tcp",
+                   uint16_t port = 80);
+  Status stopMdns();
+  bool mdnsRunning() const { return mdnsRunning_; }
+  Status mdnsLinkStats(MdnsLinkStats &out) const;
+  Status mdnsDiagnostics(String *outReport, bool queryNetwork = true);
+
+  Status startHttpServer(uint16_t port = 80, bool exposeAnalysis = true);
+  Status stopHttpServer();
+  bool httpServerRunning() const { return httpRunning_; }
+  Status httpServerStats(HttpServerStats &out) const;
+  Status httpHandleClient();
 
  private:
   struct KnownProfile {
@@ -619,6 +682,7 @@ class ConnectivityService {
                                    uint8_t channelHint,
                                    const uint8_t *bssidHint,
                                    bool allowHintOverride);
+  void refreshWifiContextLocked() const;
 
   SemaphoreHandle_t stateMutex_;
   bool wifiStarted_;
@@ -630,6 +694,21 @@ class ConnectivityService {
   size_t profileCount_;
   int lastConnectedIndex_;
   bool profilesLoaded_;
+  bool mdnsRunning_ = false;
+  String mdnsHost_;
+  String mdnsInstance_;
+  String mdnsService_;
+  String mdnsProto_;
+  uint16_t mdnsPort_ = 0;
+  uint32_t mdnsStartedAtMs_ = 0;
+
+  WebServer *httpServer_ = nullptr;
+  bool httpRunning_ = false;
+  uint16_t httpPort_ = 0;
+  uint32_t httpStartedAtMs_ = 0;
+  uint32_t httpRequestCount_ = 0;
+  bool httpExposeAnalysis_ = true;
+  mutable WifiContextSnapshot wifiContext_;
 };
 
 class AudioService {

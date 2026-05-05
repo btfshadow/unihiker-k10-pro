@@ -21,7 +21,7 @@ static void drawStatus(const String &title,
   d.textAt(line1, 10, 86, color, 36, true);
   d.textAt(line2, 10, 116, color, 36, true);
   d.textAt("A: connect auto", 10, 250, 0x444444, 26, true);
-  d.textAt("B: analyze env", 10, 276, 0x444444, 26, true);
+  d.textAt("B: qr wifi listen", 10, 276, 0x444444, 26, true);
   d.update();
 }
 
@@ -29,6 +29,7 @@ static void printHelp() {
   USBSerial.println("wifi cmd:");
   USBSerial.println("  help");
   USBSerial.println("  stats");
+  USBSerial.println("  context");
   USBSerial.println("  scan");
   USBSerial.println("  analyze");
   USBSerial.println("  connect known");
@@ -38,7 +39,14 @@ static void printHelp() {
   USBSerial.println("  forget <ssid>");
   USBSerial.println("  clear");
   USBSerial.println("  disconnect");
-  USBSerial.println("  qr WIFI:T:WPA;S:MinhaRede;P:Senha123;;");
+  USBSerial.println("  qr listen");
+  USBSerial.println("  mdns start <host>");
+  USBSerial.println("  mdns stop");
+  USBSerial.println("  mdns stats");
+  USBSerial.println("  mdns query");
+  USBSerial.println("  http start [port]");
+  USBSerial.println("  http stop");
+  USBSerial.println("  http stats");
 }
 
 static bool splitPair(const String &text, String *left, String *right) {
@@ -91,17 +99,37 @@ static void onButtonA() {
   runAutoConnect(true);
 }
 
-static void onButtonB() {
-  String report;
-  Status st = board.connectivity().analyzeEnvironment(&report, 8, true);
-  if (!st.ok()) {
-    USBSerial.printf("wifi analyze fail: %s\n", st.message);
-    drawStatus("analyze erro", st.message, "", 0x880000);
+static void runQrListen() {
+  drawStatus("qr wifi", "abrindo camera IA", "aponte QR compativel", 0x003366);
+
+  WifiConnectOptions options;
+  options.timeoutMs = 10000;
+  options.allowScanFallback = false;
+  options.useStoredRadioHints = true;
+  options.persistOnSuccess = true;
+
+  String payload;
+  Status st = board.connectivity().waitAndConnectFromVisionQr(board.vision(),
+                                                              options,
+                                                              30000,
+                                                              180,
+                                                              &payload);
+  USBSerial.printf("wifi qr listen: %s\n", st.ok() ? "ok" : st.message);
+  if (payload.length() > 0) {
+    USBSerial.printf("wifi qr payload: %s\n", payload.c_str());
+  }
+
+  if (st.ok()) {
+    drawFromStats();
     return;
   }
 
-  USBSerial.println(report);
-  drawStatus("analyze ok", "relatorio no serial", "comando: scan", 0x003366);
+  String hint = payload.length() > 0 ? payload.substring(0, 34) : "sem qr wifi valido";
+  drawStatus("qr wifi", st.message, hint, 0x884400);
+}
+
+static void onButtonB() {
+  runQrListen();
 }
 
 static void processCommand(const String &line) {
@@ -129,6 +157,38 @@ static void processCommand(const String &line) {
                        stats.dns1.c_str(),
                        (unsigned)stats.knownProfiles,
                        (unsigned long)stats.reconnectCount);
+    }
+    drawFromStats();
+    return;
+  }
+
+  if (line == "context") {
+    WifiContextSnapshot ctx;
+    Status st = board.connectivity().wifiContext(ctx, true);
+    USBSerial.printf("wifi context: %s\n", st.ok() ? "ok" : st.message);
+    if (st.ok()) {
+      USBSerial.printf("  connected=%s status=%u ssid=%s bssid=%s\n",
+                       ctx.connected ? "yes" : "no",
+                       (unsigned)ctx.statusCode,
+                       ctx.ssid.c_str(),
+                       ctx.bssid.c_str());
+      USBSerial.printf("  ip=%s gw=%s mask=%s dns1=%s dns2=%s\n",
+                       ctx.localIp.c_str(),
+                       ctx.gatewayIp.c_str(),
+                       ctx.subnetMask.c_str(),
+                       ctx.dns1.c_str(),
+                       ctx.dns2.c_str());
+      USBSerial.printf("  mac=%s rssi=%ld quality=%u channel=%u\n",
+                       ctx.stationMac.c_str(),
+                       (long)ctx.rssi,
+                       (unsigned)ctx.qualityPercent,
+                       (unsigned)ctx.channel);
+      USBSerial.printf("  known=%u reconnect=%lu success=%lu connectedSince=%lu updatedAt=%lu\n",
+                       (unsigned)ctx.knownProfiles,
+                       (unsigned long)ctx.reconnectCount,
+                       (unsigned long)ctx.successfulConnectCount,
+                       (unsigned long)ctx.connectedSinceMs,
+                       (unsigned long)ctx.updatedAtMs);
     }
     drawFromStats();
     return;
@@ -235,19 +295,91 @@ static void processCommand(const String &line) {
     return;
   }
 
-  if (line.startsWith("qr ")) {
-    String payload = line.substring(3);
-    payload.trim();
+  if (line == "qr listen") {
+    runQrListen();
+    return;
+  }
 
-    WifiConnectOptions options;
-    options.timeoutMs = 10000;
-    options.allowScanFallback = false;
-    options.useStoredRadioHints = true;
-    options.persistOnSuccess = true;
+  if (line.startsWith("mdns start ")) {
+    String host = line.substring(11);
+    host.trim();
+    Status st = board.connectivity().startMdns(host,
+                                               "unihiker-pro",
+                                               "unihiker",
+                                               "tcp",
+                                               80);
+    USBSerial.printf("mdns start: %s\n", st.ok() ? "ok" : st.message);
+    return;
+  }
 
-    Status st = board.connectivity().connectFromQrPayload(payload, options);
-    USBSerial.printf("wifi qr connect: %s\n", st.ok() ? "ok" : st.message);
-    drawFromStats();
+  if (line == "mdns stop") {
+    Status st = board.connectivity().stopMdns();
+    USBSerial.printf("mdns stop: %s\n", st.ok() ? "ok" : st.message);
+    return;
+  }
+
+  if (line == "mdns stats") {
+    MdnsLinkStats md;
+    Status st = board.connectivity().mdnsLinkStats(md);
+    USBSerial.printf("mdns stats: %s\n", st.ok() ? "ok" : st.message);
+    if (st.ok()) {
+      USBSerial.printf("  running=%s host=%s instance=%s service=%s proto=%s port=%u\n",
+                       md.running ? "yes" : "no",
+                       md.host.c_str(),
+                       md.instance.c_str(),
+                       md.service.c_str(),
+                       md.proto.c_str(),
+                       (unsigned)md.port);
+    }
+    return;
+  }
+
+  if (line == "mdns query") {
+    String report;
+    Status st = board.connectivity().mdnsDiagnostics(&report, true);
+    USBSerial.printf("mdns query: %s\n", st.ok() ? "ok" : st.message);
+    if (st.ok()) {
+      USBSerial.println(report);
+    }
+    return;
+  }
+
+  if (line.startsWith("http start")) {
+    uint16_t port = 80;
+    if (line.length() > 10) {
+      String p = line.substring(10);
+      p.trim();
+      long parsed = p.toInt();
+      if (parsed > 0 && parsed <= 65535) {
+        port = (uint16_t)parsed;
+      }
+    }
+    Status st = board.connectivity().startHttpServer(port, true);
+    USBSerial.printf("http start: %s\n", st.ok() ? "ok" : st.message);
+    if (st.ok()) {
+      USBSerial.printf("http endpoints: /health /wifi/stats /mdns/stats /wifi/analyze\n");
+    }
+    return;
+  }
+
+  if (line == "http stop") {
+    Status st = board.connectivity().stopHttpServer();
+    USBSerial.printf("http stop: %s\n", st.ok() ? "ok" : st.message);
+    return;
+  }
+
+  if (line == "http stats") {
+    HttpServerStats hs;
+    Status st = board.connectivity().httpServerStats(hs);
+    USBSerial.printf("http stats: %s\n", st.ok() ? "ok" : st.message);
+    if (st.ok()) {
+      USBSerial.printf("  running=%s port=%u startedAt=%lu requests=%lu analyze=%s\n",
+                       hs.running ? "yes" : "no",
+                       (unsigned)hs.port,
+                       (unsigned long)hs.startedAtMs,
+                       (unsigned long)hs.requestCount,
+                       hs.exposeAnalysis ? "on" : "off");
+    }
     return;
   }
 
@@ -307,6 +439,7 @@ void setup() {
 }
 
 void loop() {
+  (void)board.connectivity().httpHandleClient();
   handleSerial();
 
   if (millis() - gLastUiMs >= 2500) {

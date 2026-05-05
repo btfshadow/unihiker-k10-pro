@@ -2,7 +2,9 @@
 
 #include <Arduino.h>
 #include <Preferences.h>
+#include <ESPmDNS.h>
 #include <WiFi.h>
+#include <WebServer.h>
 #include <Wire.h>
 #include <asr.h>
 #include <esp_camera.h>
@@ -315,6 +317,35 @@ static bool parseQrBool(const String &value) {
   normalized.trim();
   return normalized == "1" || normalized == "true" || normalized == "t" ||
          normalized == "yes" || normalized == "y";
+}
+
+static String jsonEscape(const String &input) {
+  String out;
+  out.reserve(input.length() + 8);
+  for (size_t i = 0; i < input.length(); ++i) {
+    char c = input[i];
+    switch (c) {
+      case '"':
+        out += "\\\"";
+        break;
+      case '\\':
+        out += "\\\\";
+        break;
+      case '\n':
+        out += "\\n";
+        break;
+      case '\r':
+        out += "\\r";
+        break;
+      case '\t':
+        out += "\\t";
+        break;
+      default:
+        out += c;
+        break;
+    }
+  }
+  return out;
 }
 
 static Status copyApiFile(const String &srcApiPath,
@@ -2509,8 +2540,16 @@ Status ConnectivityService::loadProfilesFromPrefsLocked() {
   lastConnectedIndex_ = -1;
 
   Preferences prefs;
-  if (!prefs.begin(kPrefsNamespace, true)) {
-    return Status::Error(StatusCode::IOError, "failed to open wifi preferences");
+  bool opened = prefs.begin(kPrefsNamespace, true);
+  if (!opened) {
+    // First boot may not have namespace yet; open RW to create/access it.
+    opened = prefs.begin(kPrefsNamespace, false);
+  }
+  if (!opened) {
+    // Keep Wi-Fi usable even when NVS is temporarily unavailable.
+    profilesLoaded_ = true;
+    USBSerial.println("wifi.warn: preferences unavailable; using volatile profiles");
+    return Status::OkStatus();
   }
 
   size_t savedCount = (size_t)prefs.getUInt("count", 0);
@@ -2569,7 +2608,8 @@ Status ConnectivityService::loadProfilesFromPrefsLocked() {
 Status ConnectivityService::saveProfilesToPrefsLocked() {
   Preferences prefs;
   if (!prefs.begin(kPrefsNamespace, false)) {
-    return Status::Error(StatusCode::IOError, "failed to write wifi preferences");
+    USBSerial.println("wifi.warn: failed to write preferences; keeping volatile profiles");
+    return Status::OkStatus();
   }
 
   prefs.clear();
@@ -3087,6 +3127,11 @@ Status ConnectivityService::disconnect(bool eraseConfig) {
 
   WiFi.disconnect(false, eraseConfig);
   connectedSinceMs_ = 0;
+  if (mdnsRunning_) {
+    MDNS.end();
+    mdnsRunning_ = false;
+    mdnsStartedAtMs_ = 0;
+  }
 
   unlockState();
   return Status::OkStatus();
@@ -3111,6 +3156,48 @@ String ConnectivityService::dnsIp(uint8_t index) const {
     return WiFi.dnsIP(0).toString();
   }
   return WiFi.dnsIP(1).toString();
+}
+
+void ConnectivityService::refreshWifiContextLocked() const {
+  WifiContextSnapshot snapshot;
+  wl_status_t wifiStatus = WiFi.status();
+
+  snapshot.connected = (wifiStatus == WL_CONNECTED);
+  snapshot.statusCode = (uint8_t)wifiStatus;
+  snapshot.stationMac = WiFi.macAddress();
+  snapshot.knownProfiles = profileCount_;
+  snapshot.reconnectCount = reconnectCount_;
+  snapshot.successfulConnectCount = successfulConnectCount_;
+  snapshot.connectedSinceMs = connectedSinceMs_;
+  snapshot.updatedAtMs = millis();
+
+  if (snapshot.connected) {
+    snapshot.ssid = WiFi.SSID();
+    snapshot.bssid = WiFi.BSSIDstr();
+    snapshot.rssi = WiFi.RSSI();
+    snapshot.channel = (uint8_t)WiFi.channel();
+    snapshot.qualityPercent = rssiToQuality(snapshot.rssi);
+    snapshot.localIp = WiFi.localIP().toString();
+    snapshot.gatewayIp = WiFi.gatewayIP().toString();
+    snapshot.subnetMask = WiFi.subnetMask().toString();
+    snapshot.dns1 = WiFi.dnsIP(0).toString();
+    snapshot.dns2 = WiFi.dnsIP(1).toString();
+  }
+
+  wifiContext_ = snapshot;
+}
+
+Status ConnectivityService::wifiContext(WifiContextSnapshot &out, bool refresh) const {
+  Status st = lockState();
+  if (!st.ok()) return st;
+
+  if (refresh) {
+    refreshWifiContextLocked();
+  }
+
+  out = wifiContext_;
+  unlockState();
+  return Status::OkStatus();
 }
 
 Status ConnectivityService::scan(WifiScanResult *outEntries,
@@ -3339,32 +3426,457 @@ Status ConnectivityService::connectFromVisionQr(VisionService &vision,
   return connectFromQrPayload(payload, options);
 }
 
+Status ConnectivityService::waitAndConnectFromVisionQr(VisionService &vision,
+                                                       const WifiConnectOptions &options,
+                                                       uint32_t timeoutMs,
+                                                       uint32_t pollMs,
+                                                       String *outPayload) {
+  if (timeoutMs < 1000) timeoutMs = 1000;
+  if (pollMs < 60) pollMs = 60;
+
+  if (outPayload) {
+    outPayload->remove(0);
+  }
+
+  Status st = vision.init();
+  if (!st.ok()) return st;
+
+  AiMode previousMode = vision.mode();
+  bool startedLive = false;
+
+  if (!vision.liveAimActive()) {
+    st = vision.startLiveAim(false);
+    if (!st.ok()) return st;
+    startedLive = true;
+  }
+
+  st = vision.setMode(AiMode::Code);
+  if (!st.ok()) {
+    if (startedLive) {
+      (void)vision.stopLiveAim();
+    } else {
+      (void)vision.setMode(previousMode);
+    }
+    return st;
+  }
+
+  auto cleanupVision = [&]() {
+    if (startedLive) {
+      (void)vision.stopLiveAim();
+    } else {
+      (void)vision.setMode(previousMode);
+    }
+  };
+
+  uint32_t deadline = millis() + timeoutMs;
+  while ((int32_t)(deadline - millis()) > 0) {
+    if (!vision.detected()) {
+      delay(pollMs);
+      continue;
+    }
+
+    String payload = vision.qrPayload();
+    payload.trim();
+    if (payload.length() == 0) {
+      delay(pollMs);
+      continue;
+    }
+
+    if (outPayload) {
+      *outPayload = payload;
+    }
+
+    String ssidValue;
+    String passValue;
+    bool hidden = false;
+    Status parseSt = parseWifiQrPayload(payload, &ssidValue, &passValue, &hidden);
+    if (!parseSt.ok()) {
+      // Ignore non-WiFi QR payloads while waiting inside listen window.
+      delay(pollMs);
+      continue;
+    }
+
+    (void)hidden;
+    Status connSt = connect(ssidValue, passValue, options);
+    cleanupVision();
+    return connSt;
+  }
+
+  cleanupVision();
+  return Status::Error(StatusCode::Busy, "wifi qr listen timeout");
+}
+
 Status ConnectivityService::linkStats(WifiLinkStats &out) const {
   out = WifiLinkStats();
 
   Status st = lockState();
   if (!st.ok()) return st;
-  out.knownProfiles = profileCount_;
-  out.reconnectCount = reconnectCount_;
-  out.connectedSinceMs = connectedSinceMs_;
+  refreshWifiContextLocked();
+
+  out.connected = wifiContext_.connected;
+  out.ssid = wifiContext_.ssid;
+  out.bssid = wifiContext_.bssid;
+  out.rssi = wifiContext_.rssi;
+  out.channel = wifiContext_.channel;
+  out.qualityPercent = wifiContext_.qualityPercent;
+  out.localIp = wifiContext_.localIp;
+  out.gatewayIp = wifiContext_.gatewayIp;
+  out.subnetMask = wifiContext_.subnetMask;
+  out.dns1 = wifiContext_.dns1;
+  out.dns2 = wifiContext_.dns2;
+  out.connectedSinceMs = wifiContext_.connectedSinceMs;
+  out.reconnectCount = wifiContext_.reconnectCount;
+  out.knownProfiles = wifiContext_.knownProfiles;
+
   unlockState();
 
-  out.connected = connected();
-  if (!out.connected) {
+  return Status::OkStatus();
+}
+
+Status ConnectivityService::startMdns(const String &host,
+                                      const String &instance,
+                                      const String &service,
+                                      const String &proto,
+                                      uint16_t port) {
+  String hostClean = trimCopy(host);
+  String instanceClean = trimCopy(instance);
+  String serviceClean = trimCopy(service);
+  String protoClean = trimCopy(proto);
+  hostClean.toLowerCase();
+  serviceClean.toLowerCase();
+  protoClean.toLowerCase();
+
+  if (hostClean.length() == 0) {
+    return Status::Error(StatusCode::InvalidArgument, "mdns host is empty");
+  }
+  if (port == 0) {
+    return Status::Error(StatusCode::InvalidArgument, "mdns port is invalid");
+  }
+
+  Status st = lockState();
+  if (!st.ok()) return st;
+
+  st = ensureWifiStartedLocked();
+  if (!st.ok()) {
+    unlockState();
+    return st;
+  }
+
+  if (WiFi.status() != WL_CONNECTED) {
+    unlockState();
+    return Status::Error(StatusCode::NotInitialized, "wifi not connected");
+  }
+
+  if (mdnsRunning_) {
+    MDNS.end();
+    mdnsRunning_ = false;
+  }
+
+  if (!MDNS.begin(hostClean.c_str())) {
+    unlockState();
+    return Status::Error(StatusCode::IOError, "mdns begin failed");
+  }
+
+  if (instanceClean.length() > 0) {
+    MDNS.setInstanceName(instanceClean.c_str());
+  }
+
+  if (serviceClean.length() > 0 && protoClean.length() > 0) {
+    MDNS.addService(serviceClean.c_str(), protoClean.c_str(), port);
+    MDNS.addServiceTxt(serviceClean.c_str(), protoClean.c_str(), "sdk", "unihiker-pro");
+    MDNS.addServiceTxt(serviceClean.c_str(), protoClean.c_str(), "fw", "connectivity-v2");
+  }
+
+  mdnsRunning_ = true;
+  mdnsHost_ = hostClean;
+  mdnsInstance_ = instanceClean;
+  mdnsService_ = serviceClean;
+  mdnsProto_ = protoClean;
+  mdnsPort_ = port;
+  mdnsStartedAtMs_ = millis();
+
+  unlockState();
+  return Status::OkStatus();
+}
+
+Status ConnectivityService::stopMdns() {
+  Status st = lockState();
+  if (!st.ok()) return st;
+
+  if (mdnsRunning_) {
+    MDNS.end();
+    mdnsRunning_ = false;
+    mdnsStartedAtMs_ = 0;
+  }
+
+  unlockState();
+  return Status::OkStatus();
+}
+
+Status ConnectivityService::mdnsLinkStats(MdnsLinkStats &out) const {
+  out = MdnsLinkStats();
+
+  Status st = lockState();
+  if (!st.ok()) return st;
+
+  out.running = mdnsRunning_;
+  out.host = mdnsHost_;
+  out.instance = mdnsInstance_;
+  out.service = mdnsService_;
+  out.proto = mdnsProto_;
+  out.port = mdnsPort_;
+  out.startedAtMs = mdnsStartedAtMs_;
+
+  unlockState();
+  return Status::OkStatus();
+}
+
+Status ConnectivityService::mdnsDiagnostics(String *outReport, bool queryNetwork) {
+  if (outReport == nullptr) {
+    return Status::Error(StatusCode::InvalidArgument, "mdns report output is null");
+  }
+
+  MdnsLinkStats stats;
+  Status st = mdnsLinkStats(stats);
+  if (!st.ok()) return st;
+
+  String report;
+  report.reserve(640);
+  report += "mdns diagnostics\n";
+  report += String("running=") + (stats.running ? "yes" : "no") + "\n";
+  report += String("host=") + stats.host + "\n";
+  report += String("instance=") + stats.instance + "\n";
+  report += String("service=") + stats.service + "._" + stats.proto + "\n";
+  report += String("port=") + String((unsigned long)stats.port) + "\n";
+
+  if (!stats.running || !queryNetwork) {
+    *outReport = report;
     return Status::OkStatus();
   }
 
-  out.ssid = ssid();
-  out.bssid = bssid();
-  out.rssi = rssi();
-  out.channel = (uint8_t)WiFi.channel();
-  out.qualityPercent = rssiToQuality(out.rssi);
-  out.localIp = localIp();
-  out.gatewayIp = gatewayIp();
-  out.subnetMask = subnetMask();
-  out.dns1 = dnsIp(0);
-  out.dns2 = dnsIp(1);
+  if (stats.host.length() > 0) {
+    IPAddress ip = MDNS.queryHost(stats.host.c_str());
+    report += String("host_ip=") + ip.toString() + "\n";
+  }
 
+  if (stats.service.length() > 0 && stats.proto.length() > 0) {
+    int n = MDNS.queryService(stats.service.c_str(), stats.proto.c_str());
+    report += String("service_matches=") + String((long)n) + "\n";
+    if (n > 0) {
+      for (int i = 0; i < n; ++i) {
+        report += String("  ") + String((long)(i + 1));
+        report += ") ";
+        report += MDNS.hostname(i);
+        report += " ";
+        report += MDNS.IP(i).toString();
+        report += ":";
+        report += String((unsigned long)MDNS.port(i));
+        report += "\n";
+      }
+    }
+  }
+
+  *outReport = report;
+  return Status::OkStatus();
+}
+
+Status ConnectivityService::startHttpServer(uint16_t port, bool exposeAnalysis) {
+  if (port == 0) {
+    return Status::Error(StatusCode::InvalidArgument, "http port is invalid");
+  }
+
+  Status st = lockState();
+  if (!st.ok()) return st;
+
+  st = ensureWifiStartedLocked();
+  if (!st.ok()) {
+    unlockState();
+    return st;
+  }
+
+  if (WiFi.status() != WL_CONNECTED) {
+    unlockState();
+    return Status::Error(StatusCode::NotInitialized, "wifi not connected");
+  }
+
+  if (httpServer_ != nullptr) {
+    httpServer_->stop();
+    delete httpServer_;
+    httpServer_ = nullptr;
+    httpRunning_ = false;
+  }
+
+  WebServer *server = new WebServer(port);
+  if (!server) {
+    unlockState();
+    return Status::Error(StatusCode::IOError, "http server allocation failed");
+  }
+
+  httpServer_ = server;
+  httpPort_ = port;
+  httpExposeAnalysis_ = exposeAnalysis;
+  httpRequestCount_ = 0;
+
+  httpServer_->on("/", HTTP_GET, [this]() {
+    httpRequestCount_++;
+    String body;
+    body.reserve(180);
+    body += "unihiker-pro connectivity\n";
+    body += "GET /health\n";
+    body += "GET /wifi/stats\n";
+    body += "GET /mdns/stats\n";
+    if (httpExposeAnalysis_) {
+      body += "GET /wifi/analyze\n";
+    }
+    httpServer_->send(200, "text/plain", body);
+  });
+
+  httpServer_->on("/health", HTTP_GET, [this]() {
+    httpRequestCount_++;
+    WifiLinkStats ws;
+    Status lst = linkStats(ws);
+    MdnsLinkStats ms;
+    Status mst = mdnsLinkStats(ms);
+
+    String body;
+    body.reserve(360);
+    body += "{";
+    body += String("\"ok\":") + ((lst.ok() && mst.ok()) ? "true" : "false");
+    body += String(",\"wifiConnected\":") + (ws.connected ? "true" : "false");
+    body += String(",\"ssid\":\"") + jsonEscape(ws.ssid) + "\"";
+    body += String(",\"ip\":\"") + jsonEscape(ws.localIp) + "\"";
+    body += String(",\"mdnsRunning\":") + (ms.running ? "true" : "false");
+    body += String(",\"mdnsHost\":\"") + jsonEscape(ms.host) + "\"";
+    body += "}";
+    httpServer_->send((lst.ok() && mst.ok()) ? 200 : 500,
+                      "application/json",
+                      body);
+  });
+
+  httpServer_->on("/wifi/stats", HTTP_GET, [this]() {
+    httpRequestCount_++;
+    WifiLinkStats ws;
+    Status stStats = linkStats(ws);
+    if (!stStats.ok()) {
+      httpServer_->send(500, "text/plain", stStats.message ? stStats.message : "error");
+      return;
+    }
+
+    String body;
+    body.reserve(540);
+    body += "{";
+    body += String("\"connected\":") + (ws.connected ? "true" : "false");
+    body += String(",\"ssid\":\"") + jsonEscape(ws.ssid) + "\"";
+    body += String(",\"bssid\":\"") + jsonEscape(ws.bssid) + "\"";
+    body += String(",\"rssi\":") + String((long)ws.rssi);
+    body += String(",\"quality\":") + String((unsigned long)ws.qualityPercent);
+    body += String(",\"channel\":") + String((unsigned long)ws.channel);
+    body += String(",\"ip\":\"") + jsonEscape(ws.localIp) + "\"";
+    body += String(",\"gateway\":\"") + jsonEscape(ws.gatewayIp) + "\"";
+    body += String(",\"dns1\":\"") + jsonEscape(ws.dns1) + "\"";
+    body += String(",\"dns2\":\"") + jsonEscape(ws.dns2) + "\"";
+    body += String(",\"knownProfiles\":") + String((unsigned long)ws.knownProfiles);
+    body += String(",\"reconnectCount\":") + String((unsigned long)ws.reconnectCount);
+    body += "}";
+    httpServer_->send(200, "application/json", body);
+  });
+
+  httpServer_->on("/mdns/stats", HTTP_GET, [this]() {
+    httpRequestCount_++;
+    MdnsLinkStats ms;
+    Status stMd = mdnsLinkStats(ms);
+    if (!stMd.ok()) {
+      httpServer_->send(500, "text/plain", stMd.message ? stMd.message : "error");
+      return;
+    }
+
+    String body;
+    body.reserve(320);
+    body += "{";
+    body += String("\"running\":") + (ms.running ? "true" : "false");
+    body += String(",\"host\":\"") + jsonEscape(ms.host) + "\"";
+    body += String(",\"instance\":\"") + jsonEscape(ms.instance) + "\"";
+    body += String(",\"service\":\"") + jsonEscape(ms.service) + "\"";
+    body += String(",\"proto\":\"") + jsonEscape(ms.proto) + "\"";
+    body += String(",\"port\":") + String((unsigned long)ms.port);
+    body += "}";
+    httpServer_->send(200, "application/json", body);
+  });
+
+  httpServer_->on("/wifi/analyze", HTTP_GET, [this]() {
+    httpRequestCount_++;
+    if (!httpExposeAnalysis_) {
+      httpServer_->send(403, "text/plain", "analysis endpoint disabled");
+      return;
+    }
+
+    String report;
+    Status stAn = analyzeEnvironment(&report, 10, true);
+    if (!stAn.ok()) {
+      httpServer_->send(500, "text/plain", stAn.message ? stAn.message : "error");
+      return;
+    }
+    httpServer_->send(200, "text/plain", report);
+  });
+
+  httpServer_->onNotFound([this]() {
+    httpRequestCount_++;
+    httpServer_->send(404, "text/plain", "not found");
+  });
+
+  httpServer_->begin();
+  httpRunning_ = true;
+  httpStartedAtMs_ = millis();
+
+  unlockState();
+  return Status::OkStatus();
+}
+
+Status ConnectivityService::stopHttpServer() {
+  Status st = lockState();
+  if (!st.ok()) return st;
+
+  if (httpServer_ != nullptr) {
+    httpServer_->stop();
+    delete httpServer_;
+    httpServer_ = nullptr;
+  }
+
+  httpRunning_ = false;
+  httpPort_ = 0;
+  httpStartedAtMs_ = 0;
+
+  unlockState();
+  return Status::OkStatus();
+}
+
+Status ConnectivityService::httpServerStats(HttpServerStats &out) const {
+  out = HttpServerStats();
+
+  Status st = lockState();
+  if (!st.ok()) return st;
+
+  out.running = httpRunning_;
+  out.port = httpPort_;
+  out.startedAtMs = httpStartedAtMs_;
+  out.requestCount = httpRequestCount_;
+  out.exposeAnalysis = httpExposeAnalysis_;
+
+  unlockState();
+  return Status::OkStatus();
+}
+
+Status ConnectivityService::httpHandleClient() {
+  Status st = lockState();
+  if (!st.ok()) return st;
+
+  if (!httpRunning_ || httpServer_ == nullptr) {
+    unlockState();
+    return Status::OkStatus();
+  }
+
+  httpServer_->handleClient();
+  unlockState();
   return Status::OkStatus();
 }
 
