@@ -68,6 +68,24 @@ class DisplayService {
   uint32_t canvasSessionId_;
 };
 
+struct InputButtonCounters {
+  uint32_t a = 0;
+  uint32_t b = 0;
+  uint32_t ab = 0;
+};
+
+struct InputDiagnostics {
+  uint32_t received = 0;
+  uint32_t emitted = 0;
+  uint32_t suppressed = 0;
+  uint32_t duplicatesDetected = 0;
+  InputButtonCounters pressReceived;
+  InputButtonCounters releaseReceived;
+  InputButtonCounters shortEmitted;
+  InputButtonCounters longEmitted;
+  uint32_t updatedAtMs = 0;
+};
+
 class InputService {
  public:
   static constexpr uint32_t kDefaultLongPressMs = 2000;
@@ -87,8 +105,12 @@ class InputService {
                              ButtonCallback shortCallback,
                              ButtonCallback longCallback,
                              uint32_t longPressMs = kDefaultLongPressMs);
+  Status diagnostics(InputDiagnostics &out) const;
+  Status resetDiagnostics();
 
  private:
+  static constexpr uint32_t kDuplicateWindowMs = 35;
+
   struct TimedBinding {
     bool enabled = false;
     uint32_t pressedAtMs = 0;
@@ -106,12 +128,27 @@ class InputService {
   static void onReleaseBThunk();
   static void onReleaseABThunk();
 
+  ButtonCallback pressThunkFor(ButtonId button) const;
+  ButtonCallback releaseThunkFor(ButtonId button) const;
+  void handlePressEvent(ButtonId button);
+  void handleReleaseEvent(ButtonId button);
   void handleTimedPress(ButtonId button);
-  void handleTimedRelease(ButtonId button);
+  bool handleTimedRelease(ButtonId button);
+  void incrementButtonCounter(InputButtonCounters &counters, ButtonId button) const;
+  void recordReceivedLocked(ButtonId button, bool pressedEvent);
+  void markEmittedShortLocked(ButtonId button);
+  void markEmittedLongLocked(ButtonId button);
   uint8_t buttonIndex(ButtonId button) const;
 
   IBoardHal &hal_;
+  ButtonCallback pressCallbacks_[3] = {nullptr, nullptr, nullptr};
+  ButtonCallback releaseCallbacks_[3] = {nullptr, nullptr, nullptr};
   TimedBinding timedBindings_[3];
+  InputDiagnostics diagnostics_;
+  uint32_t lastPressMs_[3] = {0, 0, 0};
+  uint32_t lastReleaseMs_[3] = {0, 0, 0};
+  bool pressSeen_[3] = {false, false, false};
+  bool releaseSeen_[3] = {false, false, false};
 };
 
 class LedService {

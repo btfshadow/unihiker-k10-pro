@@ -37,3 +37,9 @@ SDK reescrita para UNIHIKER K10 com arquitetura multi-camadas:
 ## Exemplos
 - `examples/basic/basic.ino`
 - `examples/board_io_demo/board_io_demo.ino`
+- `examples/legacy_compat_demo/legacy_compat_demo.ino`
+
+## Compatibilidade com sketches legados
+- Header de shim: `src/unihiker_pro_legacy.h`
+- Shim de migracao rapida: `unihiker_pro::UniHikerProLegacyShim`
+- Objetivo: permitir port minimo de sketches que usam `k10.initScreen()`, `k10.creatCanvas()`, `k10.canvas->canvasText(...)`, `k10.buttonA->setPressedCallback(...)` e `k10.rgb->write(...)`.
