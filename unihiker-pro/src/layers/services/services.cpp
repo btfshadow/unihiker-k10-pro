@@ -154,6 +154,131 @@ static void unlockSpiStorageBus() {
     xSemaphoreGive(xSPIlMutex);
   }
 }
+
+static Status ensureApiDirectory(const String &apiDir) {
+  String sdDir;
+  if (!toSdFsPath(apiDir, &sdDir)) {
+    return Status::Error(StatusCode::InvalidArgument, "invalid storage directory");
+  }
+  if (!sdDir.startsWith("/")) {
+    sdDir = "/" + sdDir;
+  }
+
+  lockSpiStorageBus();
+
+  if (!SD.exists(sdDir.c_str())) {
+    String partial;
+    int start = 1;
+    while (start < sdDir.length()) {
+      int slash = sdDir.indexOf('/', start);
+      String segment = (slash < 0) ? sdDir.substring(start)
+                                   : sdDir.substring(start, slash);
+
+      if (segment.length() > 0) {
+        partial += "/" + segment;
+        if (!SD.exists(partial.c_str())) {
+          if (!SD.mkdir(partial.c_str())) {
+            unlockSpiStorageBus();
+            return Status::Error(StatusCode::IOError, "failed to create storage directory");
+          }
+        }
+      }
+
+      if (slash < 0) break;
+      start = slash + 1;
+    }
+  }
+
+  unlockSpiStorageBus();
+  return Status::OkStatus();
+}
+
+static String fileNameFromApiPath(const String &apiPath) {
+  int slash = apiPath.lastIndexOf('/');
+  if (slash < 0 || slash + 1 >= (int)apiPath.length()) {
+    return apiPath;
+  }
+  return apiPath.substring(slash + 1);
+}
+
+static const char *aiModeLabel(AiMode mode) {
+  switch (mode) {
+    case AiMode::Face: return "face";
+    case AiMode::FaceRecognize: return "face-rec";
+    case AiMode::FaceEnroll: return "face-enroll";
+    case AiMode::FaceDeleteAll: return "face-clear";
+    case AiMode::Cat: return "cat";
+    case AiMode::Move: return "move";
+    case AiMode::Code: return "qr";
+    case AiMode::Ocr: return "ocr";
+    case AiMode::None:
+    default:
+      return "none";
+  }
+}
+
+static Status copyApiFile(const String &srcApiPath,
+                          const String &dstApiPath,
+                          size_t *outBytes) {
+  if (outBytes) *outBytes = 0;
+
+  String srcSdPath;
+  String dstSdPath;
+  if (!toSdFsPath(srcApiPath, &srcSdPath) || !toSdFsPath(dstApiPath, &dstSdPath)) {
+    return Status::Error(StatusCode::InvalidArgument, "invalid storage path");
+  }
+  if (!srcSdPath.startsWith("/")) srcSdPath = "/" + srcSdPath;
+  if (!dstSdPath.startsWith("/")) dstSdPath = "/" + dstSdPath;
+
+  int slash = dstApiPath.lastIndexOf('/');
+  if (slash < 3) {
+    return Status::Error(StatusCode::InvalidArgument, "invalid destination path");
+  }
+
+  Status st = ensureApiDirectory(dstApiPath.substring(0, slash));
+  if (!st.ok()) return st;
+
+  lockSpiStorageBus();
+
+  File src = SD.open(srcSdPath.c_str(), FILE_READ);
+  if (!src) {
+    unlockSpiStorageBus();
+    return Status::Error(StatusCode::IOError, "failed to open source file");
+  }
+
+  if (SD.exists(dstSdPath.c_str())) {
+    (void)SD.remove(dstSdPath.c_str());
+  }
+
+  File dst = SD.open(dstSdPath.c_str(), FILE_WRITE);
+  if (!dst) {
+    src.close();
+    unlockSpiStorageBus();
+    return Status::Error(StatusCode::IOError, "failed to open destination file");
+  }
+
+  uint8_t buf[2048];
+  size_t total = 0;
+  while (true) {
+    int n = src.read(buf, sizeof(buf));
+    if (n <= 0) break;
+    if ((size_t)dst.write(buf, (size_t)n) != (size_t)n) {
+      dst.close();
+      src.close();
+      unlockSpiStorageBus();
+      return Status::Error(StatusCode::IOError, "failed to copy file data");
+    }
+    total += (size_t)n;
+  }
+
+  dst.flush();
+  dst.close();
+  src.close();
+  unlockSpiStorageBus();
+
+  if (outBytes) *outBytes = total;
+  return Status::OkStatus();
+}
 }  // namespace
 
 InputService *InputService::activeTimedController_ = nullptr;
@@ -2462,14 +2587,23 @@ Status VisionService::setMode(AiMode mode) {
     return Status::Error(StatusCode::NotInitialized, "vision not initialized");
   }
 
+  AiMode targetHalMode = mapToHalMode(mode);
   bool commandMode = isFaceCommandMode(mode);
 
-  if (mode == currentMode_ && !commandMode) {
+  // In capture workflow, keep only the selected AI mode and defer HAL loading
+  // until a workflow that really needs live AI processing is active.
+  if (workflowMode_ == VisionWorkflowMode::CaptureReview) {
+    currentMode_ = mode;
+    modeSwitchCount_++;
     unlockState();
     return Status::OkStatus();
   }
 
-  AiMode targetHalMode = mapToHalMode(mode);
+  if (mode == currentMode_ && targetHalMode == activeHalMode_ && !commandMode) {
+    unlockState();
+    return Status::OkStatus();
+  }
+
   if (targetHalMode != activeHalMode_) {
     auto status = visionHal_.switchMode(targetHalMode);
     if (!status.ok()) {
@@ -2492,6 +2626,12 @@ Status VisionService::setMode(AiMode mode) {
 Status VisionService::setWorkflowMode(VisionWorkflowMode workflowMode) {
   Status st = lockState();
   if (!st.ok()) return st;
+
+  if (!initialized_) {
+    unlockState();
+    return Status::Error(StatusCode::NotInitialized, "vision not initialized");
+  }
+
   workflowMode_ = workflowMode;
   unlockState();
   return Status::OkStatus();
@@ -2664,6 +2804,8 @@ String VisionService::describeCurrentPerception() {
 Status VisionService::captureAndReview(const String &fileNameOrPath,
                                        framesize_t framesize,
                                        const String &dirOverride) {
+  // TODO(capture): postpone deeper capture reliability tuning and static-image
+  // AI dispatch implementation to a dedicated follow-up step.
   if (!cameraService_ || !storageService_) {
     return Status::Error(StatusCode::NotSupported,
                          "capture-review requires camera+storage linkage");
@@ -2677,9 +2819,30 @@ Status VisionService::captureAndReview(const String &fileNameOrPath,
     targetPath = storageService_->imagePath(fileNameOrPath, dirOverride);
   }
 
-  st = cameraService_->captureHiRes(targetPath, framesize, nullptr);
+  const String aiTempDir = "S:/data/ai_tmp";
+  const String stagedAiPath = storageService_->dataPath(fileNameFromApiPath(targetPath), aiTempDir);
+
+  // Current K10 stack is unstable when re-registering camera at new frame sizes
+  // during workflow transitions. Keep capture path on the already registered
+  // preview queue to avoid ESP_ERR_INVALID_STATE / reset loops.
+  (void)framesize;
+  st = cameraService_->start();
   if (!st.ok()) {
     setWorkflowResult(false, targetPath, st.message);
+    return st;
+  }
+
+  st = cameraService_->capture(targetPath);
+  (void)cameraService_->stop();
+  if (!st.ok()) {
+    setWorkflowResult(false, targetPath, st.message);
+    return st;
+  }
+
+  size_t stagedBytes = 0;
+  st = copyApiFile(targetPath, stagedAiPath, &stagedBytes);
+  if (!st.ok()) {
+    setWorkflowResult(false, stagedAiPath, st.message);
     return st;
   }
 
@@ -2691,7 +2854,22 @@ Status VisionService::captureAndReview(const String &fileNameOrPath,
     (void)displayService_->update();
   }
 
-  setWorkflowResult(true, targetPath, "hi-res captured and reviewed");
+  AiMode modeForDispatch = AiMode::None;
+  Status modeSt = lockState();
+  if (modeSt.ok()) {
+    modeForDispatch = currentMode_;
+    unlockState();
+  }
+
+  String summary = String("captured->") + targetPath +
+                   String("; staged->") + stagedAiPath +
+                   String("; mode=") + aiModeLabel(modeForDispatch);
+
+  // Static-image inference for face/qr/cat/move is not available in current on-device stack.
+  // Keep data staged for AI pipeline while preserving selected mode in telemetry.
+  summary += String("; static-image inference pending");
+
+  setWorkflowResult(true, stagedAiPath, summary, stagedBytes);
   lastWorkflowResult_.detected = detected();
   return Status::OkStatus();
 }
@@ -3084,6 +3262,10 @@ String VisionService::resolveInputPath(const String &fileNameOrPath, bool *found
 
 String VisionService::buildPerceptionSummary(AiMode mode, VisionWorkflowMode workflowMode) {
   auto &ai = visionHal_.ai();
+
+  if (workflowMode == VisionWorkflowMode::CaptureReview) {
+    return String("Captura pronta (IA apos foto)");
+  }
 
   if (ai.isDetectContent(AIRecognition::Code)) {
     String payload = ai.getQrCodeContent();

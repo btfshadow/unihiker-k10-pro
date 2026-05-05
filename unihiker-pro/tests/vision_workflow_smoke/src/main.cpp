@@ -53,7 +53,6 @@ static const char *workflowName(VisionWorkflowMode mode) {
     case VisionWorkflowMode::LiveAim: return "live";
     case VisionWorkflowMode::CaptureReview: return "capture";
     case VisionWorkflowMode::InputReader: return "file";
-    case VisionWorkflowMode::Ocr: return "ocr";
     default: return "unknown";
   }
 }
@@ -99,9 +98,11 @@ static void drawSelection(const String &title = "selection",
 
 static void showLastResult() {
   const VisionWorkflowResult &r = board.vision().lastWorkflowResult();
-  USBSerial.printf("workflow result: ok=%d wf=%d mode=%d bytes=%lu src=%s summary=%s\n",
+  USBSerial.printf("workflow result: ok=%d wf=%s(%d) mode=%s(%d) bytes=%lu src=%s summary=%s\n",
                    r.ok ? 1 : 0,
+                   workflowName(r.workflow),
                    (int)r.workflow,
+                   aiModeName(r.mode),
                    (int)r.mode,
                    (unsigned long)r.analyzedBytes,
                    r.source.c_str(),
@@ -123,6 +124,10 @@ static void ensureInputSample() {
 
 static void runActiveWorkflow() {
   VisionWorkflowMode wf = kWorkflowModes[gWorkflowIndex];
+  USBSerial.printf("run request: wf=%s ai=%s live=%d\n",
+                   workflowName(wf),
+                   aiModeName(kAiModes[gAiModeIndex]),
+                   gLiveRunning ? 1 : 0);
 
   if (gLiveRunning && wf != VisionWorkflowMode::LiveAim) {
     drawState("live ativo",
@@ -161,24 +166,22 @@ static void runActiveWorkflow() {
       st = board.vision().analyzeInputFile("workflow_input.txt");
       break;
 
-    case VisionWorkflowMode::Ocr: {
-      (void)board.vision().setMode(AiMode::Ocr);
-      String out;
-      st = board.vision().runOcrOnInput("S:/data/workflow_input.txt", &out);
-      break;
-    }
-
     default:
       st = Status::Error(StatusCode::InvalidArgument, "invalid workflow mode");
       break;
   }
 
-  USBSerial.printf("run workflow %s -> code=%d msg=%s\n",
-                   workflowName(wf), (int)st.code, st.message);
+  USBSerial.printf("run workflow %s (ai=%s) -> code=%d msg=%s\n",
+                   workflowName(wf),
+                   aiModeName(kAiModes[gAiModeIndex]),
+                   (int)st.code, st.message);
 
   if (wf == VisionWorkflowMode::LiveAim && gLiveRunning && st.ok()) {
     const VisionWorkflowResult &r = board.vision().lastWorkflowResult();
-    USBSerial.printf("live feedback: %s\n", r.summary.c_str());
+    USBSerial.printf("live summary: wf=%s ai=%s summary=%s\n",
+                     workflowName(wf),
+                     aiModeName(kAiModes[gAiModeIndex]),
+                     r.summary.c_str());
     return;
   }
 
@@ -195,6 +198,7 @@ static void onButtonAShort() {
   }
 
   gWorkflowIndex = (gWorkflowIndex + 1) % kWorkflowModeCount;
+  USBSerial.printf("workflow selected: %s\n", workflowName(kWorkflowModes[gWorkflowIndex]));
   drawSelection("workflow +1", 0x000000);
 }
 
@@ -208,6 +212,7 @@ static void onButtonALong() {
   }
 
   gWorkflowIndex = (gWorkflowIndex + kWorkflowModeCount - 1) % kWorkflowModeCount;
+  USBSerial.printf("workflow selected: %s\n", workflowName(kWorkflowModes[gWorkflowIndex]));
   drawSelection("workflow -1", 0x000000);
 }
 
@@ -284,6 +289,9 @@ void setup() {
                                     kButtonLongPressMs);
 
   drawSelection("ready", 0x000000);
+  USBSerial.printf("ready: wf=%s ai=%s\n",
+                   workflowName(kWorkflowModes[gWorkflowIndex]),
+                   aiModeName(kAiModes[gAiModeIndex]));
 }
 
 void loop() {
@@ -294,7 +302,10 @@ void loop() {
     const VisionWorkflowResult &r = board.vision().lastWorkflowResult();
     if (r.summary.length() > 0) {
       if (gLiveRunning) {
-        USBSerial.printf("live summary: %s\n", r.summary.c_str());
+        USBSerial.printf("live summary: wf=%s ai=%s summary=%s\n",
+                         workflowName(kWorkflowModes[gWorkflowIndex]),
+                         aiModeName(kAiModes[gAiModeIndex]),
+                         r.summary.c_str());
         gLastShownSummary = r.summary;
       } else {
         if (r.summary != gLastShownSummary) {

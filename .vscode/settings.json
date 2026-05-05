@@ -80,6 +80,10 @@
     "/^bash -lc 'pkill -f \"platformio device monitor\" \\|\\| true; /Users/btfshadow/\\.local/bin/platformio device monitor -p /dev/cu\\.usbmodem21201 -b 115200 2>&1 \\| tee /tmp/epin_log\\.txt & MON_PID=\\$!; sleep 8; kill \\$MON_PID >/dev/null 2>&1 \\|\\| true; sleep 1; tail -n 200 /tmp/epin_log\\.txt'$/": {
       "approve": true,
       "matchCommandLine": true
+    },
+    "/^platformio --version \\|\\| true && python3 -m platformio --version \\|\\| true$/": {
+      "approve": true,
+      "matchCommandLine": true
     }
   }
 }
