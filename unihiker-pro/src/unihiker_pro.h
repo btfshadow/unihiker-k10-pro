@@ -20,6 +20,7 @@ class UniHikerPro {
   SensorService &sensors();
   StorageService &storage();
   ConnectivityService &connectivity();
+  NavigationService &navigation();
   CameraService &camera();
   AudioService &audio();
   VisionService &vision();
@@ -43,6 +44,7 @@ class UniHikerPro {
   SensorService sensorService_;
   StorageService storageService_;
   ConnectivityService connectivityService_;
+  NavigationService navigationService_;
   CameraService cameraService_;
   AudioService audioService_;
   VisionService visionService_;

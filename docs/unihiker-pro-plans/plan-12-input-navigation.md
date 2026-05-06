@@ -4,8 +4,41 @@
 Criar um plano dedicado para comportamento de botoes A/B/AB e navegacao entre telas, com contrato unico de gestos e baixo indice de evento perdido/duplicado.
 
 ## Status
-- Nao executado.
-- Fila ativa: terceiro plano da sequencia atual.
+- Em andamento.
+- Fase 1 iniciada com telemetria de input no `InputService` e smoke dedicado.
+- Fases 2 e 3 iniciadas com `NavigationService` contextual opcional.
+
+## Progresso atual
+- `InputService` agora expoe diagnostico de eventos via API:
+  - `diagnostics(InputDiagnostics &out)`
+  - `resetDiagnostics()`
+- Contadores adicionados para baseline de confiabilidade:
+  - `received`, `emitted`, `suppressed`, `duplicatesDetected`
+  - `pressReceived/releaseReceived` por A/B/AB
+  - `shortEmitted/longEmitted` por A/B/AB
+- Deteccao inicial de duplicidade por janela curta (`kDuplicateWindowMs`) para flag de bounce/retrigger.
+- Novo smoke de validacao: `unihiker-pro/tests/input_navigation_smoke` com comandos seriais:
+  - `stats`
+  - `reset`
+  - `page <n>`
+- Suite de testes unitarios UTF-8 adicionada em `unihiker-pro/tests/utf8_unit` cobrindo:
+  - preservacao de acentos e `ç`
+  - sequencias UTF-8 invalidas/truncadas
+  - clipping por codepoint sem quebrar multibyte
+
+- `NavigationService` opcional adicionado para menu por contexto:
+  - contrato de 5 acoes fixas por contexto:
+    - `A rapido` (< 2000 ms)
+    - `A lento` (>= 2000 ms)
+    - `B rapido` (< 2000 ms)
+    - `B lento` (>= 2000 ms)
+    - `AB lento` (>= 2000 ms)
+  - suporte de bloqueio durante transicao (`transitionIgnoreMs`)
+  - hints de acoes opcionais no rodape da tela
+  - UI totalmente opcional (navegacao pode ser usada sem desenhar interface)
+  - carga de metadados/labels de contexto via JSON (`upsertContextFromJson`)
+  - caminho opcional para imagem animada por contexto (`animatedImagePath`)
+  - UTF-8 habilitado para renderizacao de textos de menu/hints
 
 ## Escopo
 - Gestos de botoes: press, release, short, long e chord AB.
@@ -34,15 +67,17 @@ Criar um plano dedicado para comportamento de botoes A/B/AB e navegacao entre te
 ## Contrato alvo (V1)
 1. Chord AB: se A e B forem pressionados na janela configurada, emitir apenas AB.
 2. Supressao: ao confirmar AB, suprimir A e B daquele mesmo ciclo.
-3. Duracao: short e long por gesto; repeat opcional por tela.
+3. Duracao por botao:
+  - rapido: ate 1,9s
+  - lento: acima de 2s
 4. Prioridade: AB > A/B em conflitos temporais do mesmo ciclo.
-5. Navegacao padrao:
-   - A short: anterior
-   - B short: proximo
-   - AB short: confirmar/entrar
-   - A long: voltar
-   - B long: acao secundaria
-   - AB long: menu raiz ou contexto global
+5. Acoes fixas por contexto:
+  - A rapido
+  - A lento
+  - B rapido
+  - B lento
+  - AB lento
+6. Transicao de contexto: botoes ignorados durante janela de transicao configuravel.
 
 ## Fases
 

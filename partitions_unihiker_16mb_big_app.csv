@@ -1,0 +1,8 @@
+# Name,   Type, SubType, Offset,   Size,     Flags
+# 16MB flash layout focused on maximum firmware size (single app slot).
+# Trade-off: no OTA app slots.
+nvs,      data, nvs,     0x9000,   0x5000,
+otadata,  data, ota,     0xE000,   0x2000,
+app0,     app,  factory, 0x10000,  0xD00000,
+spiffs,   data, spiffs,  0xD10000, 0x2E0000,
+coredump, data, coredump,0xFF0000, 0x10000,

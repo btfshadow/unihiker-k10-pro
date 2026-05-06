@@ -1,5 +1,10 @@
 # Plan 13 - Speech PT-BR Model Pipeline
 
+## Status
+- Adiado temporariamente.
+- Motivo: para funcionar como baseline de produto, o plano depende de treino e provisao de artefatos nativos PT-BR (wake + TTS), fora do ciclo atual.
+- Condicao de retomada: disponibilidade de pacote PT-BR versionado e validado em hardware para wake e TTS.
+
 ## Objetivo
 Viabilizar suporte real a PT-BR no fluxo de fala do `unihiker-pro` (ASR/TTS), mantendo a implementacao orientada a produto proprio e sem depender de mudancas de fluxo de app em `external_packages`.
 
@@ -103,4 +108,4 @@ Pendente desta fase:
 - Acoplamento ao legado: manter adaptadores e configuracoes no `unihiker-pro`.
 
 ## Proximo passo imediato
-- Concluir Fase 3 com validacao em hardware do init/fallback/telemetria e ajuste final da API de perfil de fala no facade.
+- Plano pausado ate a entrega do pacote treinado PT-BR (wake + TTS) com manifest/checksum e validacao minima em hardware.

@@ -1,4 +1,5 @@
 #include "services.h"
+#include "../core/utf8_utils.h"
 
 #include <Arduino.h>
 #include <Preferences.h>
@@ -348,6 +349,85 @@ static String jsonEscape(const String &input) {
   return out;
 }
 
+static bool jsonExtractString(const String &json,
+                              const char *key,
+                              String *outValue) {
+  if (outValue == nullptr || key == nullptr) return false;
+  String needle = String("\"") + key + "\"";
+  int keyPos = json.indexOf(needle);
+  if (keyPos < 0) return false;
+
+  int colon = json.indexOf(':', keyPos + needle.length());
+  if (colon < 0) return false;
+  int firstQuote = json.indexOf('"', colon + 1);
+  if (firstQuote < 0) return false;
+
+  String value;
+  bool escaping = false;
+  for (int i = firstQuote + 1; i < (int)json.length(); ++i) {
+    char c = json[i];
+    if (escaping) {
+      value += c;
+      escaping = false;
+      continue;
+    }
+    if (c == '\\') {
+      escaping = true;
+      continue;
+    }
+    if (c == '"') {
+      *outValue = value;
+      return true;
+    }
+    value += c;
+  }
+
+  return false;
+}
+
+static bool jsonExtractBool(const String &json,
+                            const char *key,
+                            bool *outValue) {
+  if (outValue == nullptr || key == nullptr) return false;
+  String needle = String("\"") + key + "\"";
+  int keyPos = json.indexOf(needle);
+  if (keyPos < 0) return false;
+  int colon = json.indexOf(':', keyPos + needle.length());
+  if (colon < 0) return false;
+
+  int i = colon + 1;
+  while (i < (int)json.length() && (json[i] == ' ' || json[i] == '\t')) i++;
+  if (i + 4 <= (int)json.length() && json.substring(i, i + 4) == "true") {
+    *outValue = true;
+    return true;
+  }
+  if (i + 5 <= (int)json.length() && json.substring(i, i + 5) == "false") {
+    *outValue = false;
+    return true;
+  }
+  return false;
+}
+
+static bool jsonExtractUInt(const String &json,
+                            const char *key,
+                            uint32_t *outValue) {
+  if (outValue == nullptr || key == nullptr) return false;
+  String needle = String("\"") + key + "\"";
+  int keyPos = json.indexOf(needle);
+  if (keyPos < 0) return false;
+  int colon = json.indexOf(':', keyPos + needle.length());
+  if (colon < 0) return false;
+
+  int i = colon + 1;
+  while (i < (int)json.length() && (json[i] == ' ' || json[i] == '\t')) i++;
+  int start = i;
+  while (i < (int)json.length() && json[i] >= '0' && json[i] <= '9') i++;
+  if (i <= start) return false;
+
+  *outValue = (uint32_t)json.substring(start, i).toInt();
+  return true;
+}
+
 static Status copyApiFile(const String &srcApiPath,
                           const String &dstApiPath,
                           size_t *outBytes) {
@@ -413,6 +493,7 @@ static Status copyApiFile(const String &srcApiPath,
 }  // namespace
 
 InputService *InputService::activeTimedController_ = nullptr;
+NavigationService *NavigationService::activeService_ = nullptr;
 CameraService *CameraService::activeLiveController_ = nullptr;
 
 Status DisplayService::setBackground(uint32_t color) {
@@ -624,7 +705,14 @@ Status DisplayService::textRow(const String &text, uint8_t row, uint32_t color) 
   Status st = lockCanvas(&canvas);
   if (!st.ok()) return st;
 
-  canvas->canvasText(text, row, color);
+  if (utf8::isAscii(text)) {
+    canvas->canvasText(text, row, color);
+    unlockCanvas();
+    return Status::OkStatus();
+  }
+
+  utf8::latinDisplayFallbackTo(text, &textScratch_, nullptr, true);
+  canvas->canvasText(textScratch_, row, color);
   unlockCanvas();
   return Status::OkStatus();
 }
@@ -635,8 +723,81 @@ Status DisplayService::textAt(const String &text, int16_t x, int16_t y, uint32_t
   Status st = lockCanvas(&canvas);
   if (!st.ok()) return st;
 
-  canvas->canvasText(text, x, y, color, font_, count, autoClean);
+  if (utf8::isAscii(text)) {
+    canvas->canvasText(text, x, y, color, font_, count, autoClean);
+    unlockCanvas();
+    return Status::OkStatus();
+  }
+
+  bool hasNonAscii = false;
+  utf8::latinDisplayFallbackTo(text, &textScratch_, &hasNonAscii, true);
+
+  // Framework branch for count < 50 does manual byte walking and has shown
+  // instability with UTF-8 payloads in hardware tests. For UTF-8 text,
+  // force the safe path (count >= 50) handled directly by LVGL draw text.
+  int safeCount = (hasNonAscii && count < 50) ? 50 : count;
+  canvas->canvasText(textScratch_, x, y, color, font_, safeCount, autoClean);
   unlockCanvas();
+  return Status::OkStatus();
+}
+
+Status DisplayService::loadFontFile(const String &path) {
+  if (!hal_.isReady()) {
+    return Status::Error(StatusCode::NotInitialized, "board not initialized");
+  }
+
+  String requested = path;
+  requested.trim();
+  if (requested.length() == 0) {
+    return Status::Error(StatusCode::InvalidArgument, "font path is empty");
+  }
+
+  String resolved = requested;
+  String lower = requested;
+  lower.toLowerCase();
+  bool ttfAlias = false;
+  if (lower.endsWith(".ttf") || lower.endsWith(".otf")) {
+    int dot = resolved.lastIndexOf('.');
+    if (dot > 0) {
+      resolved = resolved.substring(0, dot) + ".bin";
+      ttfAlias = true;
+    }
+  }
+
+  String sdPath;
+  if (!toSdFsPath(resolved, &sdPath)) {
+    return Status::Error(StatusCode::InvalidArgument, "font path must use S:/...");
+  }
+  if (!sdPath.startsWith("/")) {
+    sdPath = "/" + sdPath;
+  }
+
+  Status sdSt = ensureSdReadyNoLoop();
+  if (!sdSt.ok()) {
+    return sdSt;
+  }
+
+  lockSpiStorageBus();
+  bool exists = SD.exists(sdPath.c_str());
+  unlockSpiStorageBus();
+  if (!exists) {
+    if (ttfAlias) {
+      return Status::Error(StatusCode::IOError,
+                           "ttf alias failed; convert to LVGL .bin first");
+    }
+    return Status::Error(StatusCode::IOError, "font file not found on SD");
+  }
+
+  return Status::Error(
+      StatusCode::NotSupported,
+      "runtime external font load is not supported without framework patch");
+}
+
+Status DisplayService::clearFontFile() {
+  if (!hal_.isReady()) {
+    return Status::Error(StatusCode::NotInitialized, "board not initialized");
+  }
+
   return Status::OkStatus();
 }
 
@@ -679,11 +840,29 @@ bool InputService::pressed(ButtonId button) {
 }
 
 Status InputService::onPress(ButtonId button, ButtonCallback callback) {
-  return hal_.attachButtonPress(button, callback);
+  if (!hal_.isReady()) {
+    return Status::Error(StatusCode::NotInitialized, "board not initialized");
+  }
+
+  uint8_t idx = buttonIndex(button);
+  timedBindings_[idx].enabled = false;
+  pressCallbacks_[idx] = callback;
+
+  activeTimedController_ = this;
+  return hal_.attachButtonPress(button, pressThunkFor(button));
 }
 
 Status InputService::onRelease(ButtonId button, ButtonCallback callback) {
-  return hal_.attachButtonRelease(button, callback);
+  if (!hal_.isReady()) {
+    return Status::Error(StatusCode::NotInitialized, "board not initialized");
+  }
+
+  uint8_t idx = buttonIndex(button);
+  timedBindings_[idx].enabled = false;
+  releaseCallbacks_[idx] = callback;
+
+  activeTimedController_ = this;
+  return hal_.attachButtonRelease(button, releaseThunkFor(button));
 }
 
 uint8_t InputService::buttonIndex(ButtonId button) const {
@@ -700,27 +879,152 @@ uint8_t InputService::buttonIndex(ButtonId button) const {
 }
 
 void InputService::onPressAThunk() {
-  if (activeTimedController_) activeTimedController_->handleTimedPress(ButtonId::A);
+  if (activeTimedController_) activeTimedController_->handlePressEvent(ButtonId::A);
 }
 
 void InputService::onPressBThunk() {
-  if (activeTimedController_) activeTimedController_->handleTimedPress(ButtonId::B);
+  if (activeTimedController_) activeTimedController_->handlePressEvent(ButtonId::B);
 }
 
 void InputService::onPressABThunk() {
-  if (activeTimedController_) activeTimedController_->handleTimedPress(ButtonId::AB);
+  if (activeTimedController_) activeTimedController_->handlePressEvent(ButtonId::AB);
 }
 
 void InputService::onReleaseAThunk() {
-  if (activeTimedController_) activeTimedController_->handleTimedRelease(ButtonId::A);
+  if (activeTimedController_) activeTimedController_->handleReleaseEvent(ButtonId::A);
 }
 
 void InputService::onReleaseBThunk() {
-  if (activeTimedController_) activeTimedController_->handleTimedRelease(ButtonId::B);
+  if (activeTimedController_) activeTimedController_->handleReleaseEvent(ButtonId::B);
 }
 
 void InputService::onReleaseABThunk() {
-  if (activeTimedController_) activeTimedController_->handleTimedRelease(ButtonId::AB);
+  if (activeTimedController_) activeTimedController_->handleReleaseEvent(ButtonId::AB);
+}
+
+ButtonCallback InputService::pressThunkFor(ButtonId button) const {
+  switch (button) {
+    case ButtonId::A:
+      return &InputService::onPressAThunk;
+    case ButtonId::B:
+      return &InputService::onPressBThunk;
+    case ButtonId::AB:
+      return &InputService::onPressABThunk;
+    default:
+      return nullptr;
+  }
+}
+
+ButtonCallback InputService::releaseThunkFor(ButtonId button) const {
+  switch (button) {
+    case ButtonId::A:
+      return &InputService::onReleaseAThunk;
+    case ButtonId::B:
+      return &InputService::onReleaseBThunk;
+    case ButtonId::AB:
+      return &InputService::onReleaseABThunk;
+    default:
+      return nullptr;
+  }
+}
+
+void InputService::incrementButtonCounter(InputButtonCounters &counters,
+                                          ButtonId button) const {
+  switch (button) {
+    case ButtonId::A:
+      counters.a++;
+      break;
+    case ButtonId::B:
+      counters.b++;
+      break;
+    case ButtonId::AB:
+      counters.ab++;
+      break;
+    default:
+      break;
+  }
+}
+
+void InputService::recordReceivedLocked(ButtonId button, bool pressedEvent) {
+  diagnostics_.received++;
+  diagnostics_.updatedAtMs = millis();
+
+  uint8_t idx = buttonIndex(button);
+  uint32_t nowMs = diagnostics_.updatedAtMs;
+  if (pressedEvent) {
+    incrementButtonCounter(diagnostics_.pressReceived, button);
+    if (pressSeen_[idx] && (uint32_t)(nowMs - lastPressMs_[idx]) <= kDuplicateWindowMs) {
+      diagnostics_.duplicatesDetected++;
+    }
+    lastPressMs_[idx] = nowMs;
+    pressSeen_[idx] = true;
+  } else {
+    incrementButtonCounter(diagnostics_.releaseReceived, button);
+    if (releaseSeen_[idx] && (uint32_t)(nowMs - lastReleaseMs_[idx]) <= kDuplicateWindowMs) {
+      diagnostics_.duplicatesDetected++;
+    }
+    lastReleaseMs_[idx] = nowMs;
+    releaseSeen_[idx] = true;
+  }
+}
+
+void InputService::markEmittedShortLocked(ButtonId button) {
+  diagnostics_.emitted++;
+  diagnostics_.updatedAtMs = millis();
+  incrementButtonCounter(diagnostics_.shortEmitted, button);
+}
+
+void InputService::markEmittedLongLocked(ButtonId button) {
+  diagnostics_.emitted++;
+  diagnostics_.updatedAtMs = millis();
+  incrementButtonCounter(diagnostics_.longEmitted, button);
+}
+
+void InputService::handlePressEvent(ButtonId button) {
+  uint8_t idx = buttonIndex(button);
+  recordReceivedLocked(button, true);
+
+  bool consumed = false;
+  if (timedBindings_[idx].enabled) {
+    handleTimedPress(button);
+    consumed = true;
+  }
+
+  ButtonCallback cb = pressCallbacks_[idx];
+  if (cb) {
+    cb();
+    diagnostics_.emitted++;
+    diagnostics_.updatedAtMs = millis();
+    consumed = true;
+  }
+
+  if (!consumed) {
+    diagnostics_.suppressed++;
+    diagnostics_.updatedAtMs = millis();
+  }
+}
+
+void InputService::handleReleaseEvent(ButtonId button) {
+  uint8_t idx = buttonIndex(button);
+  recordReceivedLocked(button, false);
+
+  bool consumed = false;
+  if (timedBindings_[idx].enabled) {
+    consumed = handleTimedRelease(button) || consumed;
+  }
+
+  ButtonCallback cb = releaseCallbacks_[idx];
+  if (cb) {
+    cb();
+    diagnostics_.emitted++;
+    diagnostics_.updatedAtMs = millis();
+    consumed = true;
+  }
+
+  if (!consumed) {
+    diagnostics_.suppressed++;
+    diagnostics_.updatedAtMs = millis();
+  }
 }
 
 void InputService::handleTimedPress(ButtonId button) {
@@ -729,15 +1033,24 @@ void InputService::handleTimedPress(ButtonId button) {
   timedBindings_[idx].pressedAtMs = millis();
 }
 
-void InputService::handleTimedRelease(ButtonId button) {
+bool InputService::handleTimedRelease(ButtonId button) {
   uint8_t idx = buttonIndex(button);
   TimedBinding &binding = timedBindings_[idx];
-  if (!binding.enabled) return;
+  if (!binding.enabled) return false;
 
   uint32_t elapsed = millis() - binding.pressedAtMs;
   bool isLong = elapsed >= binding.longPressMs;
   ButtonCallback cb = isLong ? binding.longCallback : binding.shortCallback;
-  if (cb) cb();
+  if (cb) {
+    cb();
+    if (isLong) {
+      markEmittedLongLocked(button);
+    } else {
+      markEmittedShortLocked(button);
+    }
+    return true;
+  }
+  return false;
 }
 
 Status InputService::onReleaseByDuration(ButtonId button,
@@ -773,6 +1086,8 @@ Status InputService::onReleaseByDuration(ButtonId button,
   activeTimedController_ = this;
 
   uint8_t idx = buttonIndex(button);
+  pressCallbacks_[idx] = nullptr;
+  releaseCallbacks_[idx] = nullptr;
   timedBindings_[idx].enabled = true;
   timedBindings_[idx].longPressMs = longPressMs;
   timedBindings_[idx].shortCallback = shortCallback;
@@ -784,6 +1099,401 @@ Status InputService::onReleaseByDuration(ButtonId button,
   Status s2 = hal_.attachButtonRelease(button, releaseThunk);
   if (!s2.ok()) return s2;
   return Status::OkStatus();
+}
+
+Status InputService::diagnostics(InputDiagnostics &out) const {
+  out = diagnostics_;
+  return Status::OkStatus();
+}
+
+Status InputService::resetDiagnostics() {
+  diagnostics_ = InputDiagnostics();
+  for (uint8_t i = 0; i < 3; ++i) {
+    lastPressMs_[i] = 0;
+    lastReleaseMs_[i] = 0;
+    pressSeen_[i] = false;
+    releaseSeen_[i] = false;
+  }
+  return Status::OkStatus();
+}
+
+void NavigationService::onAFastThunk() {
+  if (activeService_ != nullptr) {
+    activeService_->handleSlot(NavigationActionSlot::AFast);
+  }
+}
+
+void NavigationService::onALongThunk() {
+  if (activeService_ != nullptr) {
+    activeService_->handleSlot(NavigationActionSlot::ALong);
+  }
+}
+
+void NavigationService::onBFastThunk() {
+  if (activeService_ != nullptr) {
+    activeService_->handleSlot(NavigationActionSlot::BFast);
+  }
+}
+
+void NavigationService::onBLongThunk() {
+  if (activeService_ != nullptr) {
+    activeService_->handleSlot(NavigationActionSlot::BLong);
+  }
+}
+
+void NavigationService::onABLongThunk() {
+  if (activeService_ != nullptr) {
+    activeService_->handleSlot(NavigationActionSlot::ABLong);
+  }
+}
+
+size_t NavigationService::slotIndex(NavigationActionSlot slot) const {
+  switch (slot) {
+    case NavigationActionSlot::AFast:
+      return 0;
+    case NavigationActionSlot::ALong:
+      return 1;
+    case NavigationActionSlot::BFast:
+      return 2;
+    case NavigationActionSlot::BLong:
+      return 3;
+    case NavigationActionSlot::ABLong:
+    default:
+      return 4;
+  }
+}
+
+int NavigationService::findContextIndex(const String &id) const {
+  String key = trimCopy(id);
+  for (size_t i = 0; i < contextCount_; ++i) {
+    if (trimCopy(contexts_[i].id) == key) {
+      return (int)i;
+    }
+  }
+  return -1;
+}
+
+bool NavigationService::transitionLocked() const {
+  return (int32_t)(runtime_.transitionLockUntilMs - millis()) > 0;
+}
+
+Status NavigationService::begin(uint32_t longPressMs) {
+  if (longPressMs < 2000) {
+    longPressMs = 2000;
+  }
+
+  activeService_ = this;
+  runtime_.active = false;
+  runtime_.uiEnabled = globalUiEnabled_;
+  runtime_.utf8Enabled = globalUtf8Enabled_;
+
+  Status stA = input_.onReleaseByDuration(ButtonId::A,
+                                          &NavigationService::onAFastThunk,
+                                          &NavigationService::onALongThunk,
+                                          longPressMs);
+  if (!stA.ok()) return stA;
+
+  Status stB = input_.onReleaseByDuration(ButtonId::B,
+                                          &NavigationService::onBFastThunk,
+                                          &NavigationService::onBLongThunk,
+                                          longPressMs);
+  if (!stB.ok()) return stB;
+
+  Status stAB = input_.onReleaseByDuration(ButtonId::AB,
+                                           nullptr,
+                                           &NavigationService::onABLongThunk,
+                                           longPressMs);
+  if (!stAB.ok()) return stAB;
+
+  return Status::OkStatus();
+}
+
+Status NavigationService::upsertContext(const NavigationContext &context) {
+  NavigationContext copy = context;
+  copy.id = trimCopy(copy.id);
+  if (copy.id.length() == 0) {
+    return Status::Error(StatusCode::InvalidArgument, "navigation context id is empty");
+  }
+  if (copy.longPressMs < 2000) {
+    copy.longPressMs = 2000;
+  }
+
+  int idx = findContextIndex(copy.id);
+  if (idx >= 0) {
+    contexts_[(size_t)idx] = copy;
+    if (activeIndex_ == idx) {
+      runtime_.activeContextId = copy.id;
+      (void)renderHints();
+    }
+    return Status::OkStatus();
+  }
+
+  if (contextCount_ >= kMaxContexts) {
+    return Status::Error(StatusCode::Busy, "navigation context limit reached");
+  }
+
+  contexts_[contextCount_] = copy;
+  contextCount_++;
+  if (activeIndex_ < 0) {
+    activeIndex_ = 0;
+    runtime_.active = true;
+    runtime_.activeContextId = contexts_[0].id;
+    runtime_.switchedAtMs = millis();
+    runtime_.transitionLockUntilMs = 0;
+    (void)renderHints();
+  }
+  return Status::OkStatus();
+}
+
+Status NavigationService::removeContext(const String &id) {
+  int idx = findContextIndex(id);
+  if (idx < 0) {
+    return Status::Error(StatusCode::InvalidArgument, "navigation context not found");
+  }
+
+  for (size_t i = (size_t)idx; i + 1 < contextCount_; ++i) {
+    contexts_[i] = contexts_[i + 1];
+  }
+  if (contextCount_ > 0) {
+    contextCount_--;
+  }
+
+  if (contextCount_ == 0) {
+    activeIndex_ = -1;
+    runtime_ = NavigationRuntimeState();
+    runtime_.uiEnabled = globalUiEnabled_;
+    runtime_.utf8Enabled = globalUtf8Enabled_;
+    return Status::OkStatus();
+  }
+
+  if (activeIndex_ == idx) {
+    activeIndex_ = 0;
+    runtime_.active = true;
+    runtime_.activeContextId = contexts_[0].id;
+    runtime_.switchedAtMs = millis();
+    runtime_.transitionLockUntilMs = 0;
+    (void)renderHints();
+  } else if (activeIndex_ > idx) {
+    activeIndex_--;
+  }
+
+  return Status::OkStatus();
+}
+
+Status NavigationService::activateContext(const String &id, uint32_t transitionIgnoreMs) {
+  int idx = findContextIndex(id);
+  if (idx < 0) {
+    return Status::Error(StatusCode::InvalidArgument, "navigation context not found");
+  }
+
+  activeIndex_ = idx;
+  runtime_.active = true;
+  runtime_.activeContextId = contexts_[(size_t)idx].id;
+  runtime_.switchedAtMs = millis();
+
+  const NavigationContext &ctx = contexts_[(size_t)idx];
+  uint32_t lockMs = transitionIgnoreMs > 0 ? transitionIgnoreMs : ctx.transitionIgnoreMs;
+  if (ctx.ignoreButtonsDuringTransition && lockMs > 0) {
+    runtime_.transitionLockUntilMs = millis() + lockMs;
+  } else {
+    runtime_.transitionLockUntilMs = 0;
+  }
+
+  return renderHints();
+}
+
+Status NavigationService::activeContext(NavigationContext &out) const {
+  if (activeIndex_ < 0 || activeIndex_ >= (int)contextCount_) {
+    return Status::Error(StatusCode::NotInitialized, "navigation context inactive");
+  }
+  out = contexts_[(size_t)activeIndex_];
+  return Status::OkStatus();
+}
+
+Status NavigationService::runtimeState(NavigationRuntimeState &out) const {
+  out = runtime_;
+  return Status::OkStatus();
+}
+
+Status NavigationService::setGlobalUiEnabled(bool enabled) {
+  globalUiEnabled_ = enabled;
+  runtime_.uiEnabled = enabled;
+  if (enabled) {
+    return renderHints();
+  }
+  return Status::OkStatus();
+}
+
+Status NavigationService::setGlobalUtf8Enabled(bool enabled) {
+  globalUtf8Enabled_ = enabled;
+  runtime_.utf8Enabled = enabled;
+  return Status::OkStatus();
+}
+
+Status NavigationService::applyTransitionLock(uint32_t ms) {
+  if (ms == 0) {
+    runtime_.transitionLockUntilMs = 0;
+  } else {
+    runtime_.transitionLockUntilMs = millis() + ms;
+  }
+  return Status::OkStatus();
+}
+
+Status NavigationService::trigger(NavigationActionSlot slot) {
+  handleSlot(slot);
+  return Status::OkStatus();
+}
+
+String NavigationService::utf8Clip(const String &text, size_t maxCodepoints) const {
+  String safe = utf8::sanitize(text);
+  if (!globalUtf8Enabled_) {
+    if (safe.length() > maxCodepoints) {
+      return safe.substring(0, maxCodepoints);
+    }
+    return safe;
+  }
+
+  String out;
+  out.reserve(safe.length());
+  size_t i = 0;
+  size_t cp = 0;
+  while (i < safe.length() && cp < maxCodepoints) {
+    uint8_t b0 = (uint8_t)safe[i];
+    size_t n = 1;
+    if ((b0 & 0x80) == 0) {
+      n = 1;
+    } else if ((b0 & 0xE0) == 0xC0) {
+      n = 2;
+    } else if ((b0 & 0xF0) == 0xE0) {
+      n = 3;
+    } else if ((b0 & 0xF8) == 0xF0) {
+      n = 4;
+    } else {
+      break;
+    }
+
+    if (i + n > safe.length()) {
+      break;
+    }
+    for (size_t k = 0; k < n; ++k) {
+      out += safe[i + k];
+    }
+    i += n;
+    cp++;
+  }
+  return out;
+}
+
+void NavigationService::buildHintLine(const NavigationContext &ctx, String *outLine) const {
+  if (outLine == nullptr) return;
+  outLine->remove(0);
+  outLine->reserve(200);
+  *outLine += "A:";
+  *outLine += ctx.actions[slotIndex(NavigationActionSlot::AFast)].label;
+  *outLine += " /A2s:";
+  *outLine += ctx.actions[slotIndex(NavigationActionSlot::ALong)].label;
+  *outLine += "  B:";
+  *outLine += ctx.actions[slotIndex(NavigationActionSlot::BFast)].label;
+  *outLine += " /B2s:";
+  *outLine += ctx.actions[slotIndex(NavigationActionSlot::BLong)].label;
+  *outLine += "  AB2s:";
+  *outLine += ctx.actions[slotIndex(NavigationActionSlot::ABLong)].label;
+}
+
+Status NavigationService::renderHints() {
+  if (activeIndex_ < 0 || activeIndex_ >= (int)contextCount_) {
+    return Status::Error(StatusCode::NotInitialized, "navigation context inactive");
+  }
+
+  const NavigationContext &ctx = contexts_[(size_t)activeIndex_];
+  if (!globalUiEnabled_ || !ctx.ui.uiEnabled || !ctx.ui.showHints) {
+    return Status::OkStatus();
+  }
+
+  String line;
+  buildHintLine(ctx, &line);
+
+  if (ctx.ui.animatedImagePath.length() > 0) {
+    (void)display_.drawImage(0, 0, ctx.ui.animatedImagePath);
+  }
+
+  (void)display_.setFontSize(ctx.ui.hintFont);
+  (void)display_.textAt(utf8Clip(line, 72),
+                        6,
+                        (int16_t)ctx.ui.hintY,
+                        ctx.ui.hintColor,
+                        72,
+                        true);
+  (void)display_.update();
+  return Status::OkStatus();
+}
+
+void NavigationService::handleSlot(NavigationActionSlot slot) {
+  if (activeIndex_ < 0 || activeIndex_ >= (int)contextCount_) {
+    return;
+  }
+
+  if (transitionLocked()) {
+    return;
+  }
+
+  NavigationContext &ctx = contexts_[(size_t)activeIndex_];
+  if (!ctx.enabled) return;
+
+  NavigationAction &action = ctx.actions[slotIndex(slot)];
+  if (!action.enabled) return;
+  if (action.callback != nullptr) {
+    action.callback();
+  }
+}
+
+Status NavigationService::upsertContextFromJson(const String &jsonPayload) {
+  NavigationContext ctx;
+  if (!jsonExtractString(jsonPayload, "id", &ctx.id)) {
+    return Status::Error(StatusCode::InvalidArgument, "navigation json missing id");
+  }
+
+  String title;
+  if (jsonExtractString(jsonPayload, "title", &title)) {
+    ctx.title = title;
+  }
+
+  bool b = false;
+  if (jsonExtractBool(jsonPayload, "showHints", &b)) {
+    ctx.ui.showHints = b;
+  }
+  if (jsonExtractBool(jsonPayload, "uiEnabled", &b)) {
+    ctx.ui.uiEnabled = b;
+  }
+  if (jsonExtractBool(jsonPayload, "enabled", &b)) {
+    ctx.enabled = b;
+  }
+
+  uint32_t value = 0;
+  if (jsonExtractUInt(jsonPayload, "hintColor", &value)) {
+    ctx.ui.hintColor = value;
+  }
+  if (jsonExtractUInt(jsonPayload, "hintY", &value)) {
+    ctx.ui.hintY = (uint16_t)value;
+  }
+  if (jsonExtractUInt(jsonPayload, "transitionIgnoreMs", &value)) {
+    ctx.transitionIgnoreMs = value;
+  }
+
+  String imagePath;
+  if (jsonExtractString(jsonPayload, "animatedImagePath", &imagePath)) {
+    ctx.ui.animatedImagePath = imagePath;
+  }
+
+  const char *keys[5] = {"a_fast", "a_long", "b_fast", "b_long", "ab_long"};
+  for (size_t i = 0; i < 5; ++i) {
+    String label;
+    if (jsonExtractString(jsonPayload, keys[i], &label)) {
+      ctx.actions[i].label = label;
+    }
+  }
+
+  return upsertContext(ctx);
 }
 
 Status LedService::setRgb(int8_t index, const RgbColor &color) {
@@ -4189,32 +4899,16 @@ Status VisionService::startLiveAim(bool drawHints) {
 
   liveFeedbackEnabled_ = drawHints;
   liveAimActive_ = true;
+  overlayCacheValid_ = false;
   if (displayService_) {
     (void)displayService_->setCameraBackground(true);
   }
 
-  String summary = describeCurrentPerception();
-
-  if (liveFeedbackEnabled_ && displayService_) {
-    String title = fixedOverlayText("vision live aim", 22);
-    String summaryLine = fixedOverlayText(summary, 28);
-    String hint = fixedOverlayText("mire o alvo no centro", 26);
-
-    (void)displayService_->clearCanvas();
-    (void)displayService_->setFontSize(Canvas::eCNAndENFont16);
-    (void)displayService_->textAt(title, 8, 10, 0xFFFFFF, 24, false);
-    (void)displayService_->textAt(summaryLine, 8, 32, 0xCFE8FF, 32, false);
-    (void)displayService_->drawLine(113, 160, 127, 160, 0x66FF66);
-    (void)displayService_->drawLine(120, 153, 120, 167, 0x66FF66);
-    (void)displayService_->textAt(hint, 8, 292, 0xDDEAFF, 28, false);
-    (void)displayService_->update();
-  } else if (displayService_) {
-    // Keep plain camera preview when feedback overlay is disabled.
-    (void)displayService_->clearCanvas();
-    (void)displayService_->update();
+  st = refreshLiveAimFeedback(true);
+  if (!st.ok()) {
+    setWorkflowResult(false, "camera/live", st.message);
+    return st;
   }
-
-  setWorkflowResult(true, "camera/live", summary);
 
   if (liveFeedbackEnabled_) {
     ensureLiveFeedbackTask();
@@ -4232,6 +4926,7 @@ Status VisionService::stopLiveAim() {
   }
 
   liveAimActive_ = false;
+  overlayCacheValid_ = false;
   stopLiveFeedbackTask();
 
   Status st = cameraService_->stop();
@@ -4257,6 +4952,7 @@ Status VisionService::setLiveFeedbackEnabled(bool enabled) {
   liveFeedbackEnabled_ = enabled;
 
   if (liveAimActive_ && enabled) {
+    overlayCacheValid_ = false;
     Status st = refreshLiveAimFeedback(true);
     if (!st.ok()) return st;
     ensureLiveFeedbackTask();
@@ -4265,6 +4961,7 @@ Status VisionService::setLiveFeedbackEnabled(bool enabled) {
 
   if (liveAimActive_ && !enabled && displayService_) {
     stopLiveFeedbackTask();
+    overlayCacheValid_ = false;
     // Keep camera preview, hide overlay text/reticle.
     (void)displayService_->setCameraBackground(true);
     (void)displayService_->clearCanvas();
@@ -4300,10 +4997,25 @@ Status VisionService::refreshLiveAimFeedback(bool drawAimReticle) {
     return Status::OkStatus();
   }
 
+  bool overlayChanged = !overlayCacheValid_ ||
+                        det != lastOverlayDetected_ ||
+                        drawAimReticle != lastOverlayReticle_ ||
+                        summary != lastOverlaySummary_;
+
+  if (!overlayChanged) {
+    setWorkflowResult(true, "camera/live", summary);
+    lastWorkflowResult_.detected = det;
+    lastWorkflowResult_.recognized = recognized();
+    lastWorkflowResult_.recognitionId = recognitionId();
+    return Status::OkStatus();
+  }
+
   if (displayService_) {
-    String title = fixedOverlayText("vision live aim", 22);
+    static String title = fixedOverlayText("vision live aim", 22);
     String summaryLine = fixedOverlayText(summary, 30);
-    String statusLine = fixedOverlayText(det ? "detectado" : "varrendo cena", 24);
+    static String detectedLine = fixedOverlayText("detectado", 24);
+    static String scanningLine = fixedOverlayText("varrendo cena", 24);
+    const String &statusLine = det ? detectedLine : scanningLine;
     uint32_t color = det ? 0x66FF66 : 0xCFE8FF;
     (void)displayService_->setFontSize(Canvas::eCNAndENFont16);
     (void)displayService_->textAt(title, 8, 10, 0xFFFFFF, 24, false);
@@ -4315,6 +5027,11 @@ Status VisionService::refreshLiveAimFeedback(bool drawAimReticle) {
     (void)displayService_->textAt(statusLine, 8, 292, color, 28, false);
     (void)displayService_->update();
   }
+
+  lastOverlaySummary_ = summary;
+  lastOverlayDetected_ = det;
+  lastOverlayReticle_ = drawAimReticle;
+  overlayCacheValid_ = true;
 
   setWorkflowResult(true, "camera/live", summary);
   lastWorkflowResult_.detected = det;

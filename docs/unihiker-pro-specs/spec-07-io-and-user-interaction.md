@@ -29,3 +29,21 @@
 - Output service para LEDs e pinos digitais
 - Mapeamento documentado de índices RGB
 - Configuração central de debounce e polling
+- Diagnostico de input para stress em hardware:
+	- `diagnostics(InputDiagnostics &out)`
+	- `resetDiagnostics()`
+	- contadores de `received`, `emitted`, `suppressed`, `duplicatesDetected`
+	- contadores por botao para `press/release/short/long`
+
+## Navegacao contextual opcional
+- Deve existir modo de menu dinamico por contexto sem obrigar uso de UI.
+- Contrato base de acoes por contexto:
+	- A rapido (< 2000 ms)
+	- A lento (>= 2000 ms)
+	- B rapido (< 2000 ms)
+	- B lento (>= 2000 ms)
+	- AB lento (>= 2000 ms)
+- Durante transicao de contexto, entradas podem ser ignoradas por janela configuravel (`transitionIgnoreMs`).
+- Cada contexto deve permitir labels/acoes customizadas e opcao de mostrar hints no rodape.
+- Deve haver caminho opcional para construcao de contexto por JSON.
+- UTF-8 deve ser suportado globalmente no fluxo de exibicao de textos.

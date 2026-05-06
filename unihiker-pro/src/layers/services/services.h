@@ -54,6 +54,8 @@ class DisplayService {
   Status textRow(const String &text, uint8_t row, uint32_t color = 0x000000);
   Status textAt(const String &text, int16_t x, int16_t y, uint32_t color = 0x000000,
                 int count = 20, bool autoClean = true);
+  Status loadFontFile(const String &path);
+  Status clearFontFile();
 
   Status update();
 
@@ -66,6 +68,7 @@ class DisplayService {
   SemaphoreHandle_t canvasMutex_;
   bool canvasSessionActive_;
   uint32_t canvasSessionId_;
+  String textScratch_;
 };
 
 struct InputButtonCounters {
@@ -84,6 +87,51 @@ struct InputDiagnostics {
   InputButtonCounters shortEmitted;
   InputButtonCounters longEmitted;
   uint32_t updatedAtMs = 0;
+};
+
+enum class NavigationActionSlot : uint8_t {
+  AFast = 0,
+  ALong,
+  BFast,
+  BLong,
+  ABLong,
+};
+
+using NavigationActionCallback = void (*)();
+
+struct NavigationAction {
+  String label;
+  NavigationActionCallback callback = nullptr;
+  bool enabled = true;
+};
+
+struct NavigationUiOptions {
+  bool showHints = true;
+  bool uiEnabled = true;
+  uint32_t hintColor = 0x444444;
+  uint16_t hintY = 274;
+  Canvas::eFontSize_t hintFont = Canvas::eCNAndENFont16;
+  String animatedImagePath;
+};
+
+struct NavigationContext {
+  String id;
+  String title;
+  bool enabled = true;
+  bool ignoreButtonsDuringTransition = true;
+  uint32_t transitionIgnoreMs = 260;
+  uint32_t longPressMs = 2000;
+  NavigationUiOptions ui;
+  NavigationAction actions[5];
+};
+
+struct NavigationRuntimeState {
+  bool active = false;
+  String activeContextId;
+  uint32_t switchedAtMs = 0;
+  uint32_t transitionLockUntilMs = 0;
+  bool uiEnabled = true;
+  bool utf8Enabled = true;
 };
 
 class InputService {
@@ -149,6 +197,69 @@ class InputService {
   uint32_t lastReleaseMs_[3] = {0, 0, 0};
   bool pressSeen_[3] = {false, false, false};
   bool releaseSeen_[3] = {false, false, false};
+};
+
+class NavigationService {
+ public:
+  static constexpr size_t kMaxContexts = 10;
+  static constexpr uint32_t kDefaultLongPressMs = 2000;
+
+  NavigationService(InputService &input, DisplayService &display)
+      : input_(input),
+        display_(display),
+        contextCount_(0),
+        activeIndex_(-1),
+        globalUiEnabled_(true),
+        globalUtf8Enabled_(true) {}
+
+  Status begin(uint32_t longPressMs = kDefaultLongPressMs);
+
+  Status upsertContext(const NavigationContext &context);
+  Status removeContext(const String &id);
+  size_t contextCount() const { return contextCount_; }
+  Status activateContext(const String &id, uint32_t transitionIgnoreMs = 0);
+  Status activeContext(NavigationContext &out) const;
+  Status runtimeState(NavigationRuntimeState &out) const;
+  bool active() const { return activeIndex_ >= 0; }
+
+  Status setGlobalUiEnabled(bool enabled);
+  bool globalUiEnabled() const { return globalUiEnabled_; }
+  Status setGlobalUtf8Enabled(bool enabled);
+  bool globalUtf8Enabled() const { return globalUtf8Enabled_; }
+
+  Status applyTransitionLock(uint32_t ms);
+  Status trigger(NavigationActionSlot slot);
+  Status renderHints();
+
+  // Parses basic context metadata and labels from JSON payload.
+  // Supported keys:
+  // id,title,showHints,uiEnabled,hintColor,hintY,animatedImagePath,
+  // a_fast,a_long,b_fast,b_long,ab_long
+  Status upsertContextFromJson(const String &jsonPayload);
+
+ private:
+  static NavigationService *activeService_;
+  static void onAFastThunk();
+  static void onALongThunk();
+  static void onBFastThunk();
+  static void onBLongThunk();
+  static void onABLongThunk();
+
+  size_t slotIndex(NavigationActionSlot slot) const;
+  int findContextIndex(const String &id) const;
+  bool transitionLocked() const;
+  void handleSlot(NavigationActionSlot slot);
+  String utf8Clip(const String &text, size_t maxCodepoints) const;
+  void buildHintLine(const NavigationContext &ctx, String *outLine) const;
+
+  InputService &input_;
+  DisplayService &display_;
+  NavigationContext contexts_[kMaxContexts];
+  size_t contextCount_;
+  int activeIndex_;
+  NavigationRuntimeState runtime_;
+  bool globalUiEnabled_;
+  bool globalUtf8Enabled_;
 };
 
 class LedService {
@@ -804,6 +915,9 @@ class VisionService {
         liveFeedbackStopRequested_(false),
         liveFeedbackTask_(nullptr),
         liveFeedbackPeriodMs_(120),
+        overlayCacheValid_(false),
+        lastOverlayDetected_(false),
+        lastOverlayReticle_(false),
         initialized_(false),
         stateMutex_(xSemaphoreCreateMutex()),
         modeSwitchCount_(0) {}
@@ -886,6 +1000,10 @@ class VisionService {
   volatile bool liveFeedbackStopRequested_;
   TaskHandle_t liveFeedbackTask_;
   uint32_t liveFeedbackPeriodMs_;
+  bool overlayCacheValid_;
+  bool lastOverlayDetected_;
+  bool lastOverlayReticle_;
+  String lastOverlaySummary_;
   bool initialized_;
   SemaphoreHandle_t stateMutex_;
   uint32_t modeSwitchCount_;

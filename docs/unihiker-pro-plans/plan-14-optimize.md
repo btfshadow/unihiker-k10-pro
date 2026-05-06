@@ -1,5 +1,36 @@
 # Plan 14 - Optimize And PTBR Runtime Readiness
 
+## Status
+- Em andamento.
+- Ativado apos adiamento do Plano 13 por dependencia de treino de modelos PT-BR (wake + TTS).
+- Foco imediato: ganhos de desempenho/robustez na camada `unihiker-pro` sem depender de alteracoes em `external_packages`.
+- Fase 1 iniciada com baseline tecnico em hardware via `unihiker-pro/tests/perf_baseline_smoke`.
+
+## Progresso atual
+- Novo smoke de baseline criado: `unihiker-pro/tests/perf_baseline_smoke`.
+- Comandos seriais adicionados para medicao rapida:
+	- `snapshot` (heap, min heap, max alloc, PSRAM, flash/sketch)
+	- `bench utf8 [loops]`
+	- `bench display [loops]`
+	- `bench all [loops]`
+- Objetivo desta etapa: estabelecer numero base por firmware para comparar otimizacoes futuras por modulo.
+- Fase 2 iniciada com otimizacao de hotpath UTF-8/display:
+	- remoção de sanitizacao duplicada em `DisplayService::textRow/textAt`
+	- `utf8::latinDisplayFallback` reescrito para fluxo single-pass (validacao + transliteracao)
+	- fast-path ASCII em `sanitize` e `latinDisplayFallback` para reduzir custo em textos comuns.
+- Fase 3 iniciada com reducao de alocacoes dinamicas no caminho de render de texto:
+	- nova API `utf8::latinDisplayFallbackTo(...)` com escrita em buffer externo reutilizavel
+	- `DisplayService` agora reutiliza scratch interno para texto (`textScratch_`)
+	- remocao da varredura extra de non-ASCII em `textAt` (flag retornada pela normalizacao)
+- Fase 4 iniciada com instrumentacao comparativa reproduzivel:
+	- `perf_baseline_smoke` agora emite logs estruturados `PERF|key=value|...`
+	- novo comando serial `report [loops] [rounds]` para rodada automatizada de snapshots e benches
+	- script `unihiker-pro/scripts/capture_perf_baseline.py` para captura serial e export em `.log`, `.json` e `.csv`
+- Otimizacao de producao no fluxo de visao/live feedback:
+	- cache de overlay para pular redraw quando resumo/estado nao mudam
+	- reutilizacao de strings fixas de overlay (titulo/status) em vez de recriar a cada ciclo
+	- reducao de trabalho em `startLiveAim` reaproveitando `refreshLiveAimFeedback` para evitar desenho duplicado
+
 ## Objetivo
 foco é otimizar o código para usar abertura e fechamendo de funções de forma mais eficiente, e de otimizar o código para a placa que é um esp32-S3, ou seja tem 16 MB Flash, dualcore de 32bits com 240mhz, 512 KB de SRAM, 8 MB PSRAM, AES-128/256
 Instruções de Vetor (SIMD): Suporte a operações Single Instruction, Multiple Data (SIMD) no processador Xtensa LX7, que acelera significativamente operações matriciais e de convolução usadas em redes neurais e processamento de sinais. 

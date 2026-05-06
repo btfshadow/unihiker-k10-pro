@@ -19,8 +19,11 @@ Planos de migração da SDK para arquitetura multi-camadas.
 14. `plan-14-optimize.md`
 
 ## Proximos planos nao executados (fila sugerida)
-1. `plan-11-compatibility-and-release.md`
-2. `plan-12-input-navigation.md`
+1. `plan-14-optimize.md`
+2. `plan-15-config-portal.md`
 
 ## Plano ativo
-1. `plan-11-compatibility-and-release.md`
+1. `plan-14-optimize.md`
+
+## Planos adiados (dependencias externas)
+1. `plan-13-ptbr-speech-model.md` (dependente de treino/artefatos nativos de wake + TTS PT-BR)
