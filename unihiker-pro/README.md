@@ -42,6 +42,11 @@ SDK reescrita para UNIHIKER K10 com arquitetura multi-camadas:
 - `examples/board_io_demo/board_io_demo.ino`
 - `examples/legacy_compat_demo/legacy_compat_demo.ino`
 
+## Convencao de caminhos no cartao SD
+- Todos os caminhos de arquivos/diretorios no SD devem comecar com `S:/`.
+- Exemplos validos: `S:/photos/foto.bmp`, `S:/audio/clip.wav`, `S:/data/log.txt`.
+- Caminhos sem o prefixo `S:/` nao seguem a convencao da API publica.
+
 ## Utilitario de fonte (TTF -> LVGL BIN)
 - Script: `scripts/ttf_to_lvgl_bin.py`
 - Objetivo: converter `.ttf/.otf` para `.bin` compativel com `lv_font_load`.
