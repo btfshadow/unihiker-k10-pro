@@ -84,6 +84,21 @@ class PortalService {
   void handleApiAudioRecord();
   void handleApiSensors();
 
+  // AI provider management endpoints
+  void handleAiProvidersList(WebServer *s);
+  void handleAiProviderSave(WebServer *s);
+  void handleAiProviderDelete(WebServer *s);
+  void handleAiProviderActivate(WebServer *s);
+  void handleAiPromptsList(WebServer *s);
+  void handleAiProviderTest(WebServer *s);
+  // wrappers
+  void handleAiProvidersList();
+  void handleAiProviderSave();
+  void handleAiProviderDelete();
+  void handleAiProviderActivate();
+  void handleAiPromptsList();
+  void handleAiProviderTest();
+
   // Attach portal routes to the connectivity HTTP server (STA)
   bool registeredToExternalServer_ = false;
   void registerRoutesTo(WebServer *s);

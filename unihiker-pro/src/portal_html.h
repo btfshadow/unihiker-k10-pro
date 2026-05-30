@@ -94,6 +94,40 @@ static const char kPortalHtml[] PROGMEM = R"rawliteral(
       <button id="saveSettings" style="margin-top:8px">Save</button>
       <div id="settingsOut" class="small muted" style="margin-top:8px"></div>
     </div>
+    
+    <div class="card">
+      <h3>AI Providers</h3>
+      <label>Providers</label>
+      <select id="providersList" style="margin-bottom:8px"></select>
+      <div class="row">
+        <button id="newProvider">New</button>
+        <button id="deleteProvider">Delete</button>
+      </div>
+      <label>Id</label>
+      <input id="provId" readonly />
+      <label>Name</label>
+      <input id="provName" />
+      <label>Type</label>
+      <select id="provType"><option value="openai">OpenAI</option><option value="anthropic">Anthropic</option><option value="openrouter">OpenRouter</option><option value="hermes">Hermes</option><option value="ollama">Ollama</option><option value="offline">Offline</option><option value="custom">Custom</option></select>
+      <label>Base URL</label>
+      <input id="provBase" />
+      <label>Model</label>
+      <input id="provModel" />
+      <label>Header Name</label>
+      <input id="provHeader" placeholder="e.g. Authorization or x-api-key" />
+      <label>API Key (leave blank to keep existing)</label>
+      <input id="provApiKey" type="password" />
+      <label>Params (JSON)</label>
+      <input id="provParams" />
+      <div class="row" style="margin-top:8px"><button id="saveProvider">Save</button><button id="activateProvider">Activate</button><button id="testProvider">Test</button></div>
+      <div id="providerOut" class="small muted" style="margin-top:8px"></div>
+    </div>
+
+    <div class="card">
+      <h3>Prompts (SD)</h3>
+      <div class="small muted">Place a <code>manifest.json</code> under <code>S:/ai-prompts/manifest.json</code></div>
+      <pre id="promptsOut">-</pre>
+    </div>
   </div>
 
   <div style="margin-top:12px" class="card">
@@ -173,6 +207,43 @@ async function saveSettings(){
   id('settingsOut').innerText = await res.text(); setTimeout(refreshStatus,600); 
 }
 
+// AI providers UI
+async function loadAiProviders(){
+  try{
+    const j = await api('/api/ai/providers');
+    const sel = id('providersList'); sel.innerHTML='';
+    if (j && j.providers){
+      j.providers.forEach(p=>{
+        const opt = document.createElement('option'); opt.value = p.id; opt.text = (p.name||p.id) + ' ('+p.type+')'; sel.appendChild(opt);
+      });
+      if (j.active){ sel.value = j.active; }
+      // populate form with selected or first
+      const selVal = sel.value || (j.providers[0] && j.providers[0].id) || '';
+      const prov = j.providers.find(x=>x.id===selVal) || j.providers[0] || null;
+      if (prov) populateProviderForm(prov); else clearProviderForm();
+    } else { clearProviderForm(); }
+  }catch(e){ id('providerOut').innerText = 'load error'; }
+}
+
+function populateProviderForm(p){ id('provId').value = p.id||''; id('provName').value = p.name||''; id('provType').value = p.type||''; id('provBase').value = p.base||''; id('provModel').value = p.model||''; id('provHeader').value = p.header||''; id('provParams').value = p.params||''; id('provApiKey').value=''; id('providerOut').innerText = p.apiKeyMasked ? ('masked: '+p.apiKeyMasked) : ''; }
+function clearProviderForm(){ id('provId').value=''; id('provName').value=''; id('provType').value=''; id('provBase').value=''; id('provModel').value=''; id('provHeader').value=''; id('provParams').value=''; id('provApiKey').value=''; id('providerOut').innerText=''; }
+
+async function saveProvider(){
+  const payload = {
+    id: id('provId').value||'', name: id('provName').value||'', type: id('provType').value||'', base: id('provBase').value||'', model: id('provModel').value||'', header: id('provHeader').value||'', params: id('provParams').value||'', apiKey: id('provApiKey').value||''
+  };
+  const r = await fetch('/api/ai/provider',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(payload),credentials:'include'});
+  const txt = await r.text(); id('providerOut').innerText = txt; await loadAiProviders();
+}
+
+async function deleteProvider(){ const idv = id('providersList').value; if(!idv) return; if(!confirm('Delete provider '+idv+' ?')) return; const r = await fetch('/api/ai/provider/delete',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({id:idv}),credentials:'include'}); id('providerOut').innerText = await r.text(); await loadAiProviders(); }
+
+async function activateProvider(){ const idv = id('providersList').value; if(!idv) return; const r = await fetch('/api/ai/provider/activate',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({id:idv}),credentials:'include'}); id('providerOut').innerText = await r.text(); await loadAiProviders(); }
+
+async function testProvider(){ const idv = id('providersList').value; if(!idv) return; id('providerOut').innerText = 'testing...'; const r = await fetch('/api/ai/test',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({id:idv}),credentials:'include'}); const j = await r.json(); id('providerOut').innerText = JSON.stringify(j, null, 2); }
+
+async function loadAiPrompts(){ try{ const r = await fetch('/api/ai/prompts'); if (r.status===200){ const txt = await r.text(); id('promptsOut').innerText = txt; } else { id('promptsOut').innerText = 'no manifest'; } }catch(e){ id('promptsOut').innerText='error'; } }
+
 document.addEventListener('DOMContentLoaded', ()=>{
   id('loginBtn').onclick = doLogin;
   id('logoutBtn').onclick = doLogout;
@@ -183,7 +254,15 @@ document.addEventListener('DOMContentLoaded', ()=>{
   id('recBtn').onclick = doRecord;
   id('sensorsBtn').onclick = sensorsRefresh;
   id('saveSettings').onclick = saveSettings;
+  id('providersList').onchange = loadAiProviders;
+  id('newProvider').onclick = function(){ clearProviderForm(); id('provId').value = 'prov'+Date.now(); };
+  id('deleteProvider').onclick = deleteProvider;
+  id('saveProvider').onclick = saveProvider;
+  id('activateProvider').onclick = activateProvider;
+  id('testProvider').onclick = testProvider;
   refreshStatus();
+  loadAiProviders();
+  loadAiPrompts();
 });
 </script>
 </body>

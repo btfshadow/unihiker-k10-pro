@@ -4,6 +4,7 @@
 #include <esp_system.h>
 #include <esp_camera.h>
 #include "log.h"
+#include <HTTPClient.h>
 
 using namespace unihiker_pro;
 
@@ -177,6 +178,13 @@ void PortalService::registerRoutesTo(WebServer *s) {
   s->on("/api/camera/stream", HTTP_GET, [this, s]() { handleApiCameraStream(s); });
   s->on("/api/audio/record", HTTP_POST, [this, s]() { handleApiAudioRecord(s); });
   s->on("/api/sensors", HTTP_GET, [this, s]() { handleApiSensors(s); });
+  // AI provider management
+  s->on("/api/ai/providers", HTTP_GET, [this, s]() { handleAiProvidersList(s); });
+  s->on("/api/ai/provider", HTTP_POST, [this, s]() { handleAiProviderSave(s); });
+  s->on("/api/ai/provider/delete", HTTP_POST, [this, s]() { handleAiProviderDelete(s); });
+  s->on("/api/ai/provider/activate", HTTP_POST, [this, s]() { handleAiProviderActivate(s); });
+  s->on("/api/ai/prompts", HTTP_GET, [this, s]() { handleAiPromptsList(s); });
+  s->on("/api/ai/test", HTTP_POST, [this, s]() { handleAiProviderTest(s); });
   s->onNotFound([s]() { s->send(404, "text/plain", "not found"); });
 }
 
@@ -548,3 +556,276 @@ void PortalService::handleApiCameraSnapshot() { handleApiCameraSnapshot(server_)
 void PortalService::handleApiCameraStream() { handleApiCameraStream(server_); }
 void PortalService::handleApiAudioRecord() { handleApiAudioRecord(server_); }
 void PortalService::handleApiSensors() { handleApiSensors(server_); }
+
+// --- AI provider helpers and handlers ---
+static String _aiKeyFor(int idx, const char *field) {
+  String k = String("p") + String(idx) + "_" + String(field);
+  return k;
+}
+
+static String maskKey(const String &k) {
+  if (k.length() <= 10) return String("*****");
+  String first = k.substring(0, 5);
+  String last = k.substring(k.length() - 5);
+  return first + String("...") + last;
+}
+
+static String obfuscateKeyWithSalt(const String &plain) {
+  String mac = WiFi.macAddress();
+  mac.replace(":", "");
+  uint8_t salt = 0;
+  for (size_t i = 0; i + 1 < mac.length(); i += 2) {
+    char buf[3] = { (char)mac[i], (char)mac[i+1], 0 };
+    uint8_t v = (uint8_t)strtoul(buf, nullptr, 16);
+    salt ^= v;
+  }
+  String out;
+  out.reserve(plain.length() * 2 + 2);
+  for (size_t i = 0; i < plain.length(); ++i) {
+    uint8_t c = (uint8_t)plain[i];
+    uint8_t x = c ^ salt;
+    char tmp[3];
+    sprintf(tmp, "%02x", x);
+    out += tmp;
+  }
+  return out;
+}
+
+static String deobfuscateKeyWithSalt(const String &hexStr) {
+  String mac = WiFi.macAddress();
+  mac.replace(":", "");
+  uint8_t salt = 0;
+  for (size_t i = 0; i + 1 < mac.length(); i += 2) {
+    char buf[3] = { (char)mac[i], (char)mac[i+1], 0 };
+    uint8_t v = (uint8_t)strtoul(buf, nullptr, 16);
+    salt ^= v;
+  }
+  String out;
+  out.reserve(hexStr.length() / 2 + 1);
+  for (size_t i = 0; i + 1 < hexStr.length(); i += 2) {
+    char buf[3] = { (char)hexStr[i], (char)hexStr[i+1], 0 };
+    uint8_t v = (uint8_t)strtoul(buf, nullptr, 16);
+    char c = (char)(v ^ salt);
+    out += c;
+  }
+  return out;
+}
+
+void PortalService::handleAiProvidersList(WebServer *s) {
+  if (!s) return;
+  if (!isAuthorized(s)) { s->send(401, "application/json", "{\"error\":\"unauthorized\"}"); return; }
+  Preferences p;
+  if (!p.begin("ai", true)) {
+    s->send(200, "application/json", "{\"providers\":[],\"active\":\"\"}");
+    return;
+  }
+  int cnt = p.getInt("cnt", 0);
+  String active = p.getString("active", "");
+  String body = "{";
+  body += "\"providers\": [";
+  bool first = true;
+  for (int i = 0; i < cnt; ++i) {
+    String id = p.getString(_aiKeyFor(i, "id").c_str(), "");
+    if (id.length() == 0) continue;
+    if (!first) body += ",";
+    first = false;
+    String name = p.getString(_aiKeyFor(i, "name").c_str(), "");
+    String type = p.getString(_aiKeyFor(i, "type").c_str(), "");
+    String base = p.getString(_aiKeyFor(i, "base").c_str(), "");
+    String model = p.getString(_aiKeyFor(i, "model").c_str(), "");
+    String header = p.getString(_aiKeyFor(i, "header").c_str(), "");
+    String params = p.getString(_aiKeyFor(i, "params").c_str(), "");
+    String mask = p.getString(_aiKeyFor(i, "apimask").c_str(), "");
+    body += "{";
+    body += String("\"id\":\"") + jsonEscape(id) + String("\"");
+    body += String(",\"name\":\"") + jsonEscape(name) + String("\"");
+    body += String(",\"type\":\"") + jsonEscape(type) + String("\"");
+    body += String(",\"base\":\"") + jsonEscape(base) + String("\"");
+    body += String(",\"model\":\"") + jsonEscape(model) + String("\"");
+    body += String(",\"header\":\"") + jsonEscape(header) + String("\"");
+    body += String(",\"params\":\"") + jsonEscape(params) + String("\"");
+    body += String(",\"apiKeyMasked\":\"") + jsonEscape(mask) + String("\"");
+    body += "}";
+  }
+  body += "]";
+  body += String(",\"active\":\"") + jsonEscape(active) + String("\"");
+  body += "}";
+  p.end();
+  s->send(200, "application/json", body);
+}
+
+void PortalService::handleAiProviderSave(WebServer *s) {
+  if (!s) return;
+  if (!isAuthorized(s)) { s->send(401, "application/json", "{\"error\":\"unauthorized\"}"); return; }
+  String id = pickArgOrJson(s, "id");
+  String name = pickArgOrJson(s, "name");
+  String type = pickArgOrJson(s, "type");
+  String base = pickArgOrJson(s, "base");
+  String model = pickArgOrJson(s, "model");
+  String apiKey = pickArgOrJson(s, "apiKey");
+  String header = pickArgOrJson(s, "header");
+  String params = pickArgOrJson(s, "params");
+  String forceStr = pickArgOrJson(s, "force");
+  bool force = (forceStr == "1" || forceStr.equalsIgnoreCase("true"));
+
+  Preferences p;
+  if (!p.begin("ai", false)) { s->send(500, "application/json", "{\"ok\":false,\"error\":\"prefs_unavailable\"}"); return; }
+  int cnt = p.getInt("cnt", 0);
+  int found = -1;
+  for (int i = 0; i < cnt; ++i) {
+    String iid = p.getString(_aiKeyFor(i, "id").c_str(), "");
+    if (iid.length() && iid == id) { found = i; break; }
+  }
+  int idx = found;
+  if (idx < 0) {
+    // append
+    if (id.length() == 0) id = String("prov") + String(millis());
+    idx = cnt;
+  }
+
+  if (name.length()) p.putString(_aiKeyFor(idx, "name").c_str(), name);
+  if (type.length()) p.putString(_aiKeyFor(idx, "type").c_str(), type);
+  if (base.length()) p.putString(_aiKeyFor(idx, "base").c_str(), base);
+  if (model.length()) p.putString(_aiKeyFor(idx, "model").c_str(), model);
+  if (header.length()) p.putString(_aiKeyFor(idx, "header").c_str(), header);
+  if (params.length()) p.putString(_aiKeyFor(idx, "params").c_str(), params);
+  // id must be set
+  p.putString(_aiKeyFor(idx, "id").c_str(), id);
+
+  String existingObf = p.getString(_aiKeyFor(idx, "apiobf").c_str(), "");
+  if (apiKey.length()) {
+    String obf = obfuscateKeyWithSalt(apiKey);
+    String mask = maskKey(apiKey);
+    p.putString(_aiKeyFor(idx, "apiobf").c_str(), obf);
+    p.putString(_aiKeyFor(idx, "apimask").c_str(), mask);
+  } else {
+    if (existingObf.length() == 0 && !force) {
+      p.end();
+      s->send(400, "application/json", "{\"ok\":false,\"error\":\"no_api_key\",\"requireConfirm\":true}");
+      return;
+    }
+    // keep existing obf
+  }
+
+  if (found < 0) {
+    p.putInt("cnt", cnt + 1);
+  }
+  p.end();
+  s->send(200, "application/json", "{\"ok\":true}");
+}
+
+void PortalService::handleAiProviderDelete(WebServer *s) {
+  if (!s) return;
+  if (!isAuthorized(s)) { s->send(401, "application/json", "{\"error\":\"unauthorized\"}"); return; }
+  String id = pickArgOrJson(s, "id");
+  if (id.length() == 0) { s->send(400, "application/json", "{\"error\":\"id_missing\"}"); return; }
+  Preferences p;
+  if (!p.begin("ai", false)) { s->send(500, "application/json", "{\"error\":\"prefs_unavailable\"}"); return; }
+  int cnt = p.getInt("cnt", 0);
+  int found = -1;
+  for (int i = 0; i < cnt; ++i) {
+    String iid = p.getString(_aiKeyFor(i, "id").c_str(), "");
+    if (iid.length() && iid == id) { found = i; break; }
+  }
+  if (found < 0) { p.end(); s->send(404, "application/json", "{\"error\":\"not_found\"}"); return; }
+  // shift subsequent entries down
+  for (int i = found; i + 1 < cnt; ++i) {
+    // copy fields from i+1 to i
+    String fields[] = {"id","name","type","base","model","header","params","apiobf","apimask"};
+    for (auto &f : fields) {
+      String val = p.getString(_aiKeyFor(i+1, f.c_str()).c_str(), "");
+      p.putString(_aiKeyFor(i, f.c_str()).c_str(), val);
+    }
+  }
+  // remove last
+  int last = cnt - 1;
+  String fieldsRem[] = {"id","name","type","base","model","header","params","apiobf","apimask"};
+  for (auto &f : fieldsRem) p.remove(_aiKeyFor(last, f.c_str()).c_str());
+  p.putInt("cnt", cnt - 1);
+  String active = p.getString("active", "");
+  if (active == id) p.putString("active", "");
+  p.end();
+  s->send(200, "application/json", "{\"ok\":true}");
+}
+
+void PortalService::handleAiProviderActivate(WebServer *s) {
+  if (!s) return;
+  if (!isAuthorized(s)) { s->send(401, "application/json", "{\"error\":\"unauthorized\"}"); return; }
+  String id = pickArgOrJson(s, "id");
+  if (id.length() == 0) { s->send(400, "application/json", "{\"error\":\"id_missing\"}"); return; }
+  Preferences p;
+  if (!p.begin("ai", true)) { s->send(500, "application/json", "{\"error\":\"prefs_unavailable\"}"); return; }
+  int cnt = p.getInt("cnt", 0);
+  bool found = false;
+  for (int i = 0; i < cnt; ++i) {
+    String iid = p.getString(_aiKeyFor(i, "id").c_str(), "");
+    if (iid.length() && iid == id) { found = true; break; }
+  }
+  p.end();
+  if (!found) { s->send(404, "application/json", "{\"error\":\"not_found\"}"); return; }
+  Preferences p2;
+  if (p2.begin("ai", false)) { p2.putString("active", id); p2.end(); }
+  s->send(200, "application/json", "{\"ok\":true}");
+}
+
+void PortalService::handleAiPromptsList(WebServer *s) {
+  if (!s) return;
+  if (!isAuthorized(s)) { s->send(401, "application/json", "{\"error\":\"unauthorized\"}"); return; }
+  if (!board_) { s->send(500, "application/json", "{\"error\":\"board_missing\"}"); return; }
+  String manifestPath = "S:/ai-prompts/manifest.json";
+  String content;
+  Status st = board_->storage().readTextFile(manifestPath, &content, 16384);
+  if (!st.ok()) {
+    s->send(404, "application/json", "{\"error\":\"manifest_not_found\"}");
+    return;
+  }
+  s->send(200, "application/json", content);
+}
+
+void PortalService::handleAiProviderTest(WebServer *s) {
+  if (!s) return;
+  if (!isAuthorized(s)) { s->send(401, "application/json", "{\"error\":\"unauthorized\"}"); return; }
+  String id = pickArgOrJson(s, "id");
+  String useActive = pickArgOrJson(s, "useActive");
+  if (useActive.length() && (useActive == "1" || useActive.equalsIgnoreCase("true"))) {
+    Preferences p; if (p.begin("ai", true)) { id = p.getString("active", id); p.end(); }
+  }
+  if (id.length() == 0) { s->send(400, "application/json", "{\"error\":\"id_missing\"}"); return; }
+  Preferences p;
+  if (!p.begin("ai", true)) { s->send(500, "application/json", "{\"error\":\"prefs_unavailable\"}"); return; }
+  int cnt = p.getInt("cnt", 0);
+  int found = -1;
+  for (int i = 0; i < cnt; ++i) {
+    String iid = p.getString(_aiKeyFor(i, "id").c_str(), "");
+    if (iid.length() && iid == id) { found = i; break; }
+  }
+  if (found < 0) { p.end(); s->send(404, "application/json", "{\"error\":\"not_found\"}"); return; }
+  String base = p.getString(_aiKeyFor(found, "base").c_str(), "");
+  String header = p.getString(_aiKeyFor(found, "header").c_str(), "");
+  String obf = p.getString(_aiKeyFor(found, "apiobf").c_str(), "");
+  p.end();
+  if (base.length() == 0) { s->send(400, "application/json", "{\"error\":\"no_base_url\"}"); return; }
+  HTTPClient http;
+  http.begin(base);
+  if (header.length() && obf.length()) {
+    String key = deobfuscateKeyWithSalt(obf);
+    http.addHeader(header.c_str(), key.c_str());
+  }
+  int code = http.GET();
+  String body = "{";
+  body += String("\"code\":") + String(code);
+  String resp = http.getString();
+  if (resp.length() > 800) resp = resp.substring(0, 800);
+  body += String(",\"body\":\"") + jsonEscape(resp) + String("\"");
+  body += "}";
+  http.end();
+  s->send(200, "application/json", body);
+}
+
+// wrappers
+void PortalService::handleAiProvidersList() { handleAiProvidersList(server_); }
+void PortalService::handleAiProviderSave() { handleAiProviderSave(server_); }
+void PortalService::handleAiProviderDelete() { handleAiProviderDelete(server_); }
+void PortalService::handleAiProviderActivate() { handleAiProviderActivate(server_); }
+void PortalService::handleAiPromptsList() { handleAiPromptsList(server_); }
+void PortalService::handleAiProviderTest() { handleAiProviderTest(server_); }
