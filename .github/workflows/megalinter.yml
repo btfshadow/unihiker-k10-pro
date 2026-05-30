@@ -1,0 +1,35 @@
+name: "Mega-Linter CI"
+
+on:
+  push:
+    branches: [ 'main', 'master' ]
+  pull_request:
+    branches: [ 'main', 'master' ]
+
+jobs:
+  megalinter:
+    name: Mega-Linter
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Run Mega-Linter
+        uses: nvuillam/mega-linter-action@v4
+        env:
+          # Lint the whole repository
+          DEFAULT_WORKDIR: ./
+          VALIDATE_ALL_CODEBASE: true
+          # Fail the job when errors are found
+          FAIL_ON_ERROR: true
+          # Required by the action to publish annotations and PR comments
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      # Optional: persist reports as artifact (uncomment to enable)
+      # - name: Upload Mega-Linter reports
+      #   if: always()
+      #   uses: actions/upload-artifact@v4
+      #   with:
+      #     name: megalinter-reports
+      #     path: .mega-linter-reports/
