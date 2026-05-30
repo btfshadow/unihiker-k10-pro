@@ -1,4 +1,5 @@
 #include "services.h"
+#include "log.h"
 #include "../core/utf8_utils.h"
 
 #include <Arduino.h>
@@ -637,6 +638,8 @@ Status DisplayService::setFontSize(Canvas::eFontSize_t font) {
   return Status::OkStatus();
 }
 
+Canvas::eFontSize_t DisplayService::fontSize() const { return font_; }
+
 Status DisplayService::drawPoint(int16_t x, int16_t y, uint32_t color) {
   Canvas *canvas = nullptr;
   Status st = lockCanvas(&canvas);
@@ -1031,6 +1034,7 @@ void InputService::handleTimedPress(ButtonId button) {
   uint8_t idx = buttonIndex(button);
   if (!timedBindings_[idx].enabled) return;
   timedBindings_[idx].pressedAtMs = millis();
+  LOG_DEBUG("[InputService] Button %d pressed at %lu ms", (int)button, timedBindings_[idx].pressedAtMs);
 }
 
 bool InputService::handleTimedRelease(ButtonId button) {
@@ -1038,14 +1042,18 @@ bool InputService::handleTimedRelease(ButtonId button) {
   TimedBinding &binding = timedBindings_[idx];
   if (!binding.enabled) return false;
 
-  uint32_t elapsed = millis() - binding.pressedAtMs;
+  uint32_t now = millis();
+  uint32_t elapsed = now - binding.pressedAtMs;
   bool isLong = elapsed >= binding.longPressMs;
+  LOG_DEBUG("[InputService] Button %d released at %lu ms (elapsed: %lu ms, threshold: %lu ms) => %s", (int)button, now, elapsed, binding.longPressMs, isLong ? "LONG" : "SHORT");
   ButtonCallback cb = isLong ? binding.longCallback : binding.shortCallback;
   if (cb) {
     cb();
     if (isLong) {
+      LOG_INFO("[InputService] Long press callback called for button %d", (int)button);
       markEmittedLongLocked(button);
     } else {
+      LOG_INFO("[InputService] Short press callback called for button %d", (int)button);
       markEmittedShortLocked(button);
     }
     return true;
@@ -4427,19 +4435,21 @@ Status ConnectivityService::startHttpServer(uint16_t port, bool exposeAnalysis) 
   httpExposeAnalysis_ = exposeAnalysis;
   httpRequestCount_ = 0;
 
-  httpServer_->on("/", HTTP_GET, [this]() {
-    httpRequestCount_++;
-    String body;
-    body.reserve(180);
-    body += "unihiker-pro connectivity\n";
-    body += "GET /health\n";
-    body += "GET /wifi/stats\n";
-    body += "GET /mdns/stats\n";
-    if (httpExposeAnalysis_) {
-      body += "GET /wifi/analyze\n";
-    }
-    httpServer_->send(200, "text/plain", body);
-  });
+  if (!httpPreferPortalRoot_) {
+    httpServer_->on("/", HTTP_GET, [this]() {
+      httpRequestCount_++;
+      String body;
+      body.reserve(180);
+      body += "unihiker-pro connectivity\n";
+      body += "GET /health\n";
+      body += "GET /wifi/stats\n";
+      body += "GET /mdns/stats\n";
+      if (httpExposeAnalysis_) {
+        body += "GET /wifi/analyze\n";
+      }
+      httpServer_->send(200, "text/plain", body);
+    });
+  }
 
   httpServer_->on("/health", HTTP_GET, [this]() {
     httpRequestCount_++;
@@ -4558,6 +4568,10 @@ Status ConnectivityService::stopHttpServer() {
 
   unlockState();
   return Status::OkStatus();
+}
+
+WebServer *ConnectivityService::httpServer() {
+  return httpServer_;
 }
 
 Status ConnectivityService::httpServerStats(HttpServerStats &out) const {

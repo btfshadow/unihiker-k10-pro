@@ -40,6 +40,7 @@ class DisplayService {
   Status clearRegion(uint16_t x, uint16_t y, uint16_t w, uint16_t h);
   Status setLineWidth(uint8_t w);
   Status setFontSize(Canvas::eFontSize_t font);
+  Canvas::eFontSize_t fontSize() const;
   Status drawPoint(int16_t x, int16_t y, uint32_t color);
   Status drawLine(int x1, int y1, int x2, int y2, uint32_t color);
   Status drawCircle(int x, int y, int r, uint32_t color,
@@ -792,6 +793,11 @@ class ConnectivityService {
   bool httpServerRunning() const { return httpRunning_; }
   Status httpServerStats(HttpServerStats &out) const;
   Status httpHandleClient();
+  // Expose internal WebServer pointer to allow attaching additional routes.
+  WebServer *httpServer();
+  // When true, connectivity won't register the default '/' root handler so
+  // another component (e.g. PortalService) can own the root.
+  void setHttpPreferPortalRoot(bool prefer) { httpPreferPortalRoot_ = prefer; }
 
  private:
   struct KnownProfile {
@@ -856,6 +862,7 @@ class ConnectivityService {
   uint32_t httpStartedAtMs_ = 0;
   uint32_t httpRequestCount_ = 0;
   bool httpExposeAnalysis_ = true;
+  bool httpPreferPortalRoot_ = false;
   mutable WifiContextSnapshot wifiContext_;
 };
 

@@ -85,36 +85,56 @@ bool LegacyBoardHal::readPin(BoardPin pin) {
 Button *LegacyBoardHal::buttonFor(ButtonId button) {
   switch (button) {
     case ButtonId::A:
+      USBSerial.println("[HAL] buttonFor(ButtonId::A) => board_.buttonA");
       return board_.buttonA;
     case ButtonId::B:
+      USBSerial.println("[HAL] buttonFor(ButtonId::B) => board_.buttonB");
       return board_.buttonB;
     case ButtonId::AB:
+      USBSerial.println("[HAL] buttonFor(ButtonId::AB) => board_.buttonAB");
       return board_.buttonAB;
     default:
+      USBSerial.println("[HAL] buttonFor: invalid ButtonId");
       return nullptr;
   }
 }
 
 Status LegacyBoardHal::attachButtonPress(ButtonId button, ButtonCallback callback) {
   if (!ready_) {
+    USBSerial.println("[HAL] attachButtonPress: board not initialized");
     return Status::Error(StatusCode::NotInitialized, "board not initialized");
   }
   Button *target = buttonFor(button);
-  if (target == nullptr || callback == nullptr) {
-    return Status::Error(StatusCode::InvalidArgument, "invalid button or callback");
+  if (target == nullptr) {
+    USBSerial.println("[HAL] attachButtonPress: target button is nullptr");
+    return Status::Error(StatusCode::InvalidArgument, "invalid button");
   }
+  if (callback == nullptr) {
+    USBSerial.println("[HAL] attachButtonPress: callback is nullptr");
+    return Status::Error(StatusCode::InvalidArgument, "invalid callback");
+  }
+  USBSerial.printf("[HAL] attachButtonPress: registering callback for button %d\n", (int)button);
+  // O callback precisa ser um ponteiro de função void(). Não é possível usar lambda.
   target->setPressedCallback(callback);
   return Status::OkStatus();
 }
 
 Status LegacyBoardHal::attachButtonRelease(ButtonId button, ButtonCallback callback) {
   if (!ready_) {
+    USBSerial.println("[HAL] attachButtonRelease: board not initialized");
     return Status::Error(StatusCode::NotInitialized, "board not initialized");
   }
   Button *target = buttonFor(button);
-  if (target == nullptr || callback == nullptr) {
-    return Status::Error(StatusCode::InvalidArgument, "invalid button or callback");
+  if (target == nullptr) {
+    USBSerial.println("[HAL] attachButtonRelease: target button is nullptr");
+    return Status::Error(StatusCode::InvalidArgument, "invalid button");
   }
+  if (callback == nullptr) {
+    USBSerial.println("[HAL] attachButtonRelease: callback is nullptr");
+    return Status::Error(StatusCode::InvalidArgument, "invalid callback");
+  }
+  USBSerial.printf("[HAL] attachButtonRelease: registering callback for button %d\n", (int)button);
+  // O callback precisa ser um ponteiro de função void(). Não é possível usar lambda.
   target->setUnPressedCallback(callback);
   return Status::OkStatus();
 }
