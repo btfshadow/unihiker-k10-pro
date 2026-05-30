@@ -120,6 +120,11 @@ static const char kPortalHtml[] PROGMEM = R"rawliteral(
       <label>Params (JSON)</label>
       <input id="provParams" />
       <div class="row" style="margin-top:8px"><button id="saveProvider">Save</button><button id="activateProvider">Activate</button><button id="testProvider">Test</button></div>
+      <label>Agent Payload (raw JSON)</label>
+      <textarea id="agentPayload" style="width:100%;height:80px;margin-top:4px"></textarea>
+      <label>Path (optional)</label>
+      <input id="agentPath" placeholder="/run or /v1/agent" />
+      <div class="row" style="margin-top:8px"><button id="runAgent">Run Agent</button></div>
       <div id="providerOut" class="small muted" style="margin-top:8px"></div>
     </div>
 
@@ -241,6 +246,7 @@ async function deleteProvider(){ const idv = id('providersList').value; if(!idv)
 async function activateProvider(){ const idv = id('providersList').value; if(!idv) return; const r = await fetch('/api/ai/provider/activate',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({id:idv}),credentials:'include'}); id('providerOut').innerText = await r.text(); await loadAiProviders(); }
 
 async function testProvider(){ const idv = id('providersList').value; if(!idv) return; id('providerOut').innerText = 'testing...'; const r = await fetch('/api/ai/test',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({id:idv}),credentials:'include'}); const j = await r.json(); id('providerOut').innerText = JSON.stringify(j, null, 2); }
+async function runAgent(){ const idv = id('providersList').value; if(!idv) return; let payload = id('agentPayload').value||''; try{ JSON.parse(payload); }catch(e){ id('providerOut').innerText = 'invalid JSON payload'; return; } id('providerOut').innerText = 'running...'; const path = id('agentPath').value||''; const url = '/api/ai/agent?id='+encodeURIComponent(idv)+(path?('&path='+encodeURIComponent(path)):('')); const r = await fetch(url,{method:'POST',headers:{'Content-Type':'application/json'},body:payload,credentials:'include'}); const j = await r.json(); id('providerOut').innerText = JSON.stringify(j, null, 2); }
 
 async function loadAiPrompts(){ try{ const r = await fetch('/api/ai/prompts'); if (r.status===200){ const txt = await r.text(); id('promptsOut').innerText = txt; } else { id('promptsOut').innerText = 'no manifest'; } }catch(e){ id('promptsOut').innerText='error'; } }
 
@@ -260,6 +266,7 @@ document.addEventListener('DOMContentLoaded', ()=>{
   id('saveProvider').onclick = saveProvider;
   id('activateProvider').onclick = activateProvider;
   id('testProvider').onclick = testProvider;
+  id('runAgent').onclick = runAgent;
   refreshStatus();
   loadAiProviders();
   loadAiPrompts();

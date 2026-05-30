@@ -185,6 +185,7 @@ void PortalService::registerRoutesTo(WebServer *s) {
   s->on("/api/ai/provider/activate", HTTP_POST, [this, s]() { handleAiProviderActivate(s); });
   s->on("/api/ai/prompts", HTTP_GET, [this, s]() { handleAiPromptsList(s); });
   s->on("/api/ai/test", HTTP_POST, [this, s]() { handleAiProviderTest(s); });
+  s->on("/api/ai/agent", HTTP_POST, [this, s]() { handleAiAgentRun(s); });
   s->onNotFound([s]() { s->send(404, "text/plain", "not found"); });
 }
 
@@ -816,6 +817,81 @@ void PortalService::handleAiProviderTest(WebServer *s) {
   body += String("\"code\":") + String(code);
   String resp = http.getString();
   if (resp.length() > 800) resp = resp.substring(0, 800);
+  body += String(",\"body\":\"") + jsonEscape(resp) + String("\"");
+  body += "}";
+  http.end();
+  s->send(200, "application/json", body);
+}
+
+void PortalService::handleAiAgentRun(WebServer *s) {
+  if (!s) return;
+  if (!isAuthorized(s)) { s->send(401, "application/json", "{\"error\":\"unauthorized\"}"); return; }
+  // id can be provided as query arg or in JSON body
+  String id = pickArgOrJson(s, "id");
+  String useActive = pickArgOrJson(s, "useActive");
+  String path = pickArgOrJson(s, "path");
+  String method = pickArgOrJson(s, "method");
+  if (method.length() == 0) method = "POST";
+  String rawBody = s->arg("plain");
+  if (rawBody.length() == 0) {
+    s->send(400, "application/json", "{\"error\":\"body_required\"}");
+    return;
+  }
+  // If requested, use currently active provider
+  if (useActive.length() && (useActive == "1" || useActive.equalsIgnoreCase("true"))) {
+    Preferences p; if (p.begin("ai", true)) { id = p.getString("active", id); p.end(); }
+  }
+  if (id.length() == 0) { s->send(400, "application/json", "{\"error\":\"id_missing\"}"); return; }
+
+  Preferences p;
+  if (!p.begin("ai", true)) { s->send(500, "application/json", "{\"error\":\"prefs_unavailable\"}"); return; }
+  int cnt = p.getInt("cnt", 0);
+  int found = -1;
+  for (int i = 0; i < cnt; ++i) {
+    String iid = p.getString(_aiKeyFor(i, "id").c_str(), "");
+    if (iid.length() && iid == id) { found = i; break; }
+  }
+  if (found < 0) { p.end(); s->send(404, "application/json", "{\"error\":\"not_found\"}"); return; }
+  String base = p.getString(_aiKeyFor(found, "base").c_str(), "");
+  String header = p.getString(_aiKeyFor(found, "header").c_str(), "");
+  String obf = p.getString(_aiKeyFor(found, "apiobf").c_str(), "");
+  p.end();
+
+  if (base.length() == 0) { s->send(400, "application/json", "{\"error\":\"no_base_url\"}"); return; }
+
+  // build final URL
+  String url = base;
+  if (path.length() > 0) {
+    // ensure single slash
+    bool baseEnds = url.endsWith("/");
+    bool pathStarts = path.startsWith("/");
+    if (baseEnds && pathStarts) url = url.substring(0, url.length() - 1) + path;
+    else if (!baseEnds && !pathStarts) url = url + "/" + path;
+    else url = url + path;
+  }
+
+  HTTPClient http;
+  http.begin(url);
+  // Add auth header if present
+  if (header.length() && obf.length()) {
+    String key = deobfuscateKeyWithSalt(obf);
+    http.addHeader(header.c_str(), key.c_str());
+  }
+  // Default content-type
+  http.addHeader("Content-Type", "application/json");
+
+  int code = -1;
+  String resp;
+  if (method.equalsIgnoreCase("GET")) {
+    code = http.GET();
+    resp = http.getString();
+  } else {
+    code = http.POST(rawBody);
+    resp = http.getString();
+  }
+  if (resp.length() > 16000) resp = resp.substring(0, 16000);
+  String body = "{";
+  body += String("\"code\":") + String(code);
   body += String(",\"body\":\"") + jsonEscape(resp) + String("\"");
   body += "}";
   http.end();

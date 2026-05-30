@@ -91,6 +91,8 @@ class PortalService {
   void handleAiProviderActivate(WebServer *s);
   void handleAiPromptsList(WebServer *s);
   void handleAiProviderTest(WebServer *s);
+  void handleAiAgentRun(WebServer *s);
+  void handleAiAgentRun();
   // wrappers
   void handleAiProvidersList();
   void handleAiProviderSave();
