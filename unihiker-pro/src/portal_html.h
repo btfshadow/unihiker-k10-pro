@@ -85,6 +85,12 @@ static const char kPortalHtml[] PROGMEM = R"rawliteral(
       <input id="aiModel" />
       <label>API Key</label>
       <input id="apiKey" />
+      <label>Descanso tela (segundos)</label>
+      <input id="screenSaver" type="number" min="5" />
+      <label>Sleep (segundos)</label>
+      <input id="sleepTimeout" type="number" min="5" />
+      <label>Deep Sleep (segundos)</label>
+      <input id="deepSleep" type="number" min="5" />
       <button id="saveSettings" style="margin-top:8px">Save</button>
       <div id="settingsOut" class="small muted" style="margin-top:8px"></div>
     </div>
@@ -124,6 +130,9 @@ async function refreshStatus(){
     if(st.aiProvider) id('aiProvider').value = st.aiProvider;
     if(st.aiModel) id('aiModel').value = st.aiModel;
     if(st.apiKey) id('apiKey').value = st.apiKey;
+    if(typeof st.screenSaver !== 'undefined') id('screenSaver').value = st.screenSaver;
+    if(typeof st.sleep !== 'undefined') id('sleepTimeout').value = st.sleep;
+    if(typeof st.deepSleep !== 'undefined') id('deepSleep').value = st.deepSleep;
   }catch(e){ setStatus('status error'); }
 }
 
@@ -150,7 +159,19 @@ async function doRecord(){ const s = parseInt(id('recSec').value)||5; const r = 
 
 async function sensorsRefresh(){ const j = await api('/api/sensors'); id('sensorsOut').innerText = JSON.stringify(j, null, 2); }
 
-async function saveSettings(){ const payload = { portalPwd: id('portalPwd').value || '', aiProvider: id('aiProvider').value||'', aiModel: id('aiModel').value||'', apiKey: id('apiKey').value||'' }; const res = await fetch('/api/settings',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(payload),credentials:'include'}); id('settingsOut').innerText = await res.text(); setTimeout(refreshStatus,600); }
+async function saveSettings(){ 
+  const payload = { 
+    portalPwd: id('portalPwd').value || '',
+    aiProvider: id('aiProvider').value||'',
+    aiModel: id('aiModel').value||'',
+    apiKey: id('apiKey').value||'',
+    screenSaver: id('screenSaver').value || '',
+    sleep: id('sleepTimeout').value || '',
+    deepSleep: id('deepSleep').value || ''
+  };
+  const res = await fetch('/api/settings',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(payload),credentials:'include'});
+  id('settingsOut').innerText = await res.text(); setTimeout(refreshStatus,600); 
+}
 
 document.addEventListener('DOMContentLoaded', ()=>{
   id('loginBtn').onclick = doLogin;

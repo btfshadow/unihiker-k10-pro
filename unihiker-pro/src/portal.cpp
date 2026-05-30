@@ -255,6 +255,9 @@ void PortalService::handleSettings(WebServer *s) {
   String aiModel = pickArgOrJson(s, "aiModel");
   String apiKey = pickArgOrJson(s, "apiKey");
   String apEnabled = pickArgOrJson(s, "apEnabled");
+  String screenSaver = pickArgOrJson(s, "screenSaver");
+  String sleepTm = pickArgOrJson(s, "sleep");
+  String deepSleep = pickArgOrJson(s, "deepSleep");
 
   if (portalPwd.length()) prefs_.putString("portal_pwd", portalPwd);
   if (aiProvider.length()) prefs_.putString("ai_provider", aiProvider);
@@ -266,6 +269,29 @@ void PortalService::handleSettings(WebServer *s) {
     apAutoStart_ = enabled;
     if (!enabled && apActive_) {
       stopApInternal();
+    }
+  }
+
+  // Persist power timeouts into the LUCI prefs namespace so the app can read them.
+  if (screenSaver.length() || sleepTm.length() || deepSleep.length()) {
+    Preferences p;
+    if (p.begin("luci", false)) {
+      int curScreen = p.getInt("scr_tm", 30);
+      int curSleep = p.getInt("sleep_tm", 300);
+      int curDeep = p.getInt("dsleep_tm", 3600);
+
+      int newScreen = screenSaver.length() ? screenSaver.toInt() : curScreen;
+      int newSleep = sleepTm.length() ? sleepTm.toInt() : curSleep;
+      int newDeep = deepSleep.length() ? deepSleep.toInt() : curDeep;
+
+      if (newScreen < 5) newScreen = 5;
+      if (newSleep < newScreen) newSleep = newScreen;
+      if (newDeep < newSleep) newDeep = newSleep;
+
+      p.putInt("scr_tm", newScreen);
+      p.putInt("sleep_tm", newSleep);
+      p.putInt("dsleep_tm", newDeep);
+      p.end();
     }
   }
 
@@ -291,6 +317,18 @@ void PortalService::handleStatus(WebServer *s) {
   body += String(",\"aiModel\":\"") + jsonEscape(prefs_.getString("ai_model", "")) + String("\"");
   bool keyPresent = prefs_.getString("api_key", "").length() > 0;
   body += String(",\"apiKeyPresent\":") + (keyPresent ? "true" : "false");
+    // Include power/pref timeouts if present in the LUCI prefs namespace
+    int screenSec = 30; int sleepSec = 300; int deepSec = 3600;
+    Preferences p;
+    if (p.begin("luci", true)) {
+      screenSec = p.getInt("scr_tm", screenSec);
+      sleepSec = p.getInt("sleep_tm", sleepSec);
+      deepSec = p.getInt("dsleep_tm", deepSec);
+      p.end();
+    }
+    body += String(",\"screenSaver\":") + String(screenSec);
+    body += String(",\"sleep\":") + String(sleepSec);
+    body += String(",\"deepSleep\":") + String(deepSec);
   body += "}";
   s->send(200, "application/json", body);
 }
