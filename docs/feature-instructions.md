@@ -57,6 +57,10 @@ Device:
 - Inputs: A short, A long, B short, B long
 - Estado runtime: campos a adicionar em `luci_runtime.h`
 - Files to edit: list
+ - Voice: frases de ativação e comandos de voz (ex.: "luci abrir <funcao>");
+	 - Registrar frases no `SpeechService` via `board_.speech().queueCommand(<id>, <phrase>)` e `applyQueuedCommands()`
+	 - Sempre fornecer 1–3 frases em Português (PT-BR) e sinônimos comuns
+	 - Preferir prefixo com "luci" para reduzir falsos positivos (ex.: "luci abrir camera")
 
 Web:
 - Endpoints: list
