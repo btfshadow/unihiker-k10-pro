@@ -54,6 +54,7 @@ jobs:
       - name: Checkout Code
         uses: actions/checkout@v6
         with:
+          submodules: false
           # SECURITY NOTE: Using a Personal Access Token (PAT) is NOT
           # recommended. Open-source projects have been heavily targeted by
           # supply-chain attacks in recent months, and a leaked PAT can give
