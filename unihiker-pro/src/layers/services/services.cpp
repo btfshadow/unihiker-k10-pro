@@ -80,6 +80,7 @@ enum LiveRole : uint8_t {
 
 static bool gLvFsFatFsReady = false;
 static QueueHandle_t gLiveCaptureQueue = nullptr;
+static bool gI2cInstalled = false;
 
 static Status ensureSdReadyNoLoop() {
   if (!SD.begin()) {
@@ -106,6 +107,7 @@ static bool initLiveCaptureQueue(framesize_t size) {
   // Ensure I2C driver is installed for SCCB camera pins before probing the sensor.
   {
     i2c_config_t conf;
+    memset(&conf, 0, sizeof(conf));
     conf.mode = I2C_MODE_MASTER;
     conf.sda_io_num = (gpio_num_t)47; // CAMERA_PIN_SIOD
     conf.scl_io_num = (gpio_num_t)48; // CAMERA_PIN_SIOC
@@ -116,10 +118,13 @@ static bool initLiveCaptureQueue(framesize_t size) {
     esp_err_t r = i2c_driver_install(I2C_NUM_0, I2C_MODE_MASTER, 0, 0, 0);
     if (r == ESP_OK) {
       USBSerial.println("initLiveCaptureQueue: i2c driver installed");
+      gI2cInstalled = true;
     } else if (r == ESP_ERR_INVALID_STATE) {
       USBSerial.println("initLiveCaptureQueue: i2c driver already installed");
+      gI2cInstalled = true;
     } else {
       USBSerial.printf("initLiveCaptureQueue: i2c_driver_install failed=%d\n", (int)r);
+      gI2cInstalled = false;
     }
   }
 
@@ -911,27 +916,51 @@ uint8_t InputService::buttonIndex(ButtonId button) const {
 }
 
 void InputService::onPressAThunk() {
-  if (activeTimedController_) activeTimedController_->handlePressEvent(ButtonId::A);
+  USBSerial.println("InputService::onPressAThunk fired");
+  if (activeTimedController_) {
+    USBSerial.printf("InputService::onPressAThunk -> activeTimedController_=%p\n", (void*)activeTimedController_);
+    activeTimedController_->handlePressEvent(ButtonId::A);
+  }
 }
 
 void InputService::onPressBThunk() {
-  if (activeTimedController_) activeTimedController_->handlePressEvent(ButtonId::B);
+  USBSerial.println("InputService::onPressBThunk fired");
+  if (activeTimedController_) {
+    USBSerial.printf("InputService::onPressBThunk -> activeTimedController_=%p\n", (void*)activeTimedController_);
+    activeTimedController_->handlePressEvent(ButtonId::B);
+  }
 }
 
 void InputService::onPressABThunk() {
-  if (activeTimedController_) activeTimedController_->handlePressEvent(ButtonId::AB);
+  USBSerial.println("InputService::onPressABThunk fired");
+  if (activeTimedController_) {
+    USBSerial.printf("InputService::onPressABThunk -> activeTimedController_=%p\n", (void*)activeTimedController_);
+    activeTimedController_->handlePressEvent(ButtonId::AB);
+  }
 }
 
 void InputService::onReleaseAThunk() {
-  if (activeTimedController_) activeTimedController_->handleReleaseEvent(ButtonId::A);
+  USBSerial.println("InputService::onReleaseAThunk fired");
+  if (activeTimedController_) {
+    USBSerial.printf("InputService::onReleaseAThunk -> activeTimedController_=%p\n", (void*)activeTimedController_);
+    activeTimedController_->handleReleaseEvent(ButtonId::A);
+  }
 }
 
 void InputService::onReleaseBThunk() {
-  if (activeTimedController_) activeTimedController_->handleReleaseEvent(ButtonId::B);
+  USBSerial.println("InputService::onReleaseBThunk fired");
+  if (activeTimedController_) {
+    USBSerial.printf("InputService::onReleaseBThunk -> activeTimedController_=%p\n", (void*)activeTimedController_);
+    activeTimedController_->handleReleaseEvent(ButtonId::B);
+  }
 }
 
 void InputService::onReleaseABThunk() {
-  if (activeTimedController_) activeTimedController_->handleReleaseEvent(ButtonId::AB);
+  USBSerial.println("InputService::onReleaseABThunk fired");
+  if (activeTimedController_) {
+    USBSerial.printf("InputService::onReleaseABThunk -> activeTimedController_=%p\n", (void*)activeTimedController_);
+    activeTimedController_->handleReleaseEvent(ButtonId::AB);
+  }
 }
 
 ButtonCallback InputService::pressThunkFor(ButtonId button) const {
@@ -1015,7 +1044,7 @@ void InputService::markEmittedLongLocked(ButtonId button) {
 void InputService::handlePressEvent(ButtonId button) {
   uint8_t idx = buttonIndex(button);
   recordReceivedLocked(button, true);
-
+  USBSerial.printf("InputService::handlePressEvent button=%d timedEnabled=%d\n", (int)button, (int)timedBindings_[idx].enabled);
   bool consumed = false;
   if (timedBindings_[idx].enabled) {
     handleTimedPress(button);
@@ -1039,7 +1068,7 @@ void InputService::handlePressEvent(ButtonId button) {
 void InputService::handleReleaseEvent(ButtonId button) {
   uint8_t idx = buttonIndex(button);
   recordReceivedLocked(button, false);
-
+  USBSerial.printf("InputService::handleReleaseEvent button=%d timedEnabled=%d\n", (int)button, (int)timedBindings_[idx].enabled);
   bool consumed = false;
   if (timedBindings_[idx].enabled) {
     consumed = handleTimedRelease(button) || consumed;
@@ -1750,7 +1779,11 @@ void CameraService::onLiveBLongThunk() {
 }
 
 void CameraService::handleLiveAShort() {
-  if (!liveControllerActive_) return;
+  USBSerial.println("CameraService::handleLiveAShort called");
+  if (!liveControllerActive_) {
+    USBSerial.println("CameraService::handleLiveAShort ignored: controller inactive");
+    return;
+  }
   if (liveOptions_.onAShort) {
     liveOptions_.onAShort();
     return;
@@ -1761,7 +1794,11 @@ void CameraService::handleLiveAShort() {
 }
 
 void CameraService::handleLiveALong() {
-  if (!liveControllerActive_) return;
+  USBSerial.println("CameraService::handleLiveALong called");
+  if (!liveControllerActive_) {
+    USBSerial.println("CameraService::handleLiveALong ignored: controller inactive");
+    return;
+  }
 
   // cameraStop() clears liveOptions_, so snapshot callbacks first.
   ButtonCallback onReturnContext = liveOptions_.onReturnContext;
@@ -1775,7 +1812,11 @@ void CameraService::handleLiveALong() {
 }
 
 void CameraService::handleLiveBShort() {
-  if (!liveControllerActive_) return;
+  USBSerial.println("CameraService::handleLiveBShort called");
+  if (!liveControllerActive_) {
+    USBSerial.println("CameraService::handleLiveBShort ignored: controller inactive");
+    return;
+  }
   if (liveOptions_.onBShort) {
     liveOptions_.onBShort();
     return;
@@ -1787,7 +1828,11 @@ void CameraService::handleLiveBShort() {
 }
 
 void CameraService::handleLiveBLong() {
-  if (!liveControllerActive_) return;
+  USBSerial.println("CameraService::handleLiveBLong called");
+  if (!liveControllerActive_) {
+    USBSerial.println("CameraService::handleLiveBLong ignored: controller inactive");
+    return;
+  }
   // Default behavior for long-B: leave live context and stop camera (return to caller)
   ButtonCallback onReturnContext = liveOptions_.onReturnContext;
   ButtonCallback onBLong = liveOptions_.onBLong;
@@ -2108,6 +2153,8 @@ Status CameraService::captureHiRes(const String &path, framesize_t framesize,
     return Status::Error(StatusCode::IOError, "failed to init capture queue");
   }
 
+  USBSerial.printf("captureHiRes: requested framesize=%d, queue=%p\n", (int)framesize, (void*)gLiveCaptureQueue);
+
   if (onProgress) onProgress(0);
   drainLiveCaptureQueue();
   warmupLiveCaptureQueue(kCaptureWarmupMs);
@@ -2117,6 +2164,7 @@ Status CameraService::captureHiRes(const String &path, framesize_t framesize,
   for (uint8_t attempt = 0; attempt < 3; attempt++) {
     drainLiveCaptureQueue();
     if (xQueueReceive(gLiveCaptureQueue, &fb, pdMS_TO_TICKS(1500)) == pdTRUE && fb) {
+      USBSerial.printf("captureHiRes: received fb w=%u h=%u len=%u fmt=%d\n", (unsigned)fb->width, (unsigned)fb->height, (unsigned)fb->len, (int)fb->format);
       break;
     }
     fb = nullptr;
@@ -2126,6 +2174,7 @@ Status CameraService::captureHiRes(const String &path, framesize_t framesize,
   if (fb == nullptr) {
     return Status::Error(StatusCode::IOError, "capture timeout");
   }
+  USBSerial.printf("captureHiRes: validating fb (w=%u h=%u len=%u fmt=%d)\n", (unsigned)fb->width, (unsigned)fb->height, (unsigned)fb->len, (int)fb->format);
   if (fb->format != PIXFORMAT_RGB565) {
     esp_camera_fb_return(fb);
     return Status::Error(StatusCode::NotSupported, "camera format is not RGB565");
@@ -2134,54 +2183,18 @@ Status CameraService::captureHiRes(const String &path, framesize_t framesize,
   int32_t w = (int32_t)fb->width;
   int32_t h = (int32_t)fb->height;
   if (fb->len != (size_t)w * (size_t)h * 2U) {
+    USBSerial.printf("captureHiRes: fb len mismatch (len=%u expected=%u)\n", (unsigned)fb->len, (unsigned)((size_t)w * (size_t)h * 2U));
     esp_camera_fb_return(fb);
     return Status::Error(StatusCode::IOError, "frame length mismatch");
   }
 
   if (onProgress) onProgress(20);
 
-  uint8_t *bmpBuf = nullptr;
-  size_t bmpLen = 0;
-  bool convOk = fmt2bmp(fb->buf, fb->len,
-                        (uint16_t)w, (uint16_t)h,
-                        PIXFORMAT_RGB565,
-                        &bmpBuf, &bmpLen);
+  // Use writeBmpToSd which supports orientation correction based on
+  // the board accelerometer. Do not return the frame until write completes.
+  Status st = writeBmpToSd(path, fb, onProgress);
   esp_camera_fb_return(fb);
-
-  if (!convOk || bmpBuf == nullptr || bmpLen == 0) {
-    if (bmpBuf) free(bmpBuf);
-    return Status::Error(StatusCode::IOError, "fmt2bmp conversion failed");
-  }
-
-  String sdPath = path;
-  if (sdPath.startsWith("S:")) sdPath = sdPath.substring(2);
-
-  if (SD.exists(sdPath.c_str())) SD.remove(sdPath.c_str());
-  File f = SD.open(sdPath.c_str(), FILE_WRITE);
-  if (!f) {
-    free(bmpBuf);
-    return Status::Error(StatusCode::IOError, "failed to open file on SD");
-  }
-
-  if (onProgress) onProgress(35);
-  size_t written = 0;
-  while (written < bmpLen) {
-    size_t n = bmpLen - written;
-    if (n > 4096) n = 4096;
-    if (f.write(bmpBuf + written, n) != n) {
-      f.close();
-      free(bmpBuf);
-      return Status::Error(StatusCode::IOError, "failed to write bmp");
-    }
-    written += n;
-  }
-
-  f.flush();
-  f.close();
-  free(bmpBuf);
-
-  if (onProgress) onProgress(100);
-  return Status::OkStatus();
+  return st;
 }
 
 // BMP RGB565 header (66 bytes: 14 file header + 40 DIB + 12 color masks)
@@ -2236,37 +2249,115 @@ Status CameraService::writeBmpToSd(const String &path, camera_fb_t *fb,
   hdr.maskG          = 0x07E0;
   hdr.maskB          = 0x001F;
 
-  f.write(reinterpret_cast<const uint8_t *>(&hdr), sizeof(hdr));
+  // Determine device orientation from accelerometer and rotate pixels when I2C available
+  int accX = 0, accY = 0, accZ = 0;
+  int rotationDeg = 0; // 0, 90, 180, 270
+  if (gI2cInstalled && hal_.isReady()) {
+    accX = hal_.board().getAccelerometerX();
+    accY = hal_.board().getAccelerometerY();
+    accZ = hal_.board().getAccelerometerZ();
+    USBSerial.printf("writeBmpToSd: accel x=%d y=%d z=%d\n", accX, accY, accZ);
+    int absX = abs(accX), absY = abs(accY), absZ = abs(accZ);
+    if (absZ > absX && absZ > absY) {
+      rotationDeg = 0; // flat
+    } else if (absX >= absY) {
+      rotationDeg = (accX > 0) ? 270 : 90;
+    } else {
+      rotationDeg = (accY > 0) ? 180 : 0;
+    }
+    USBSerial.printf("writeBmpToSd: choosing rotation=%d\n", rotationDeg);
+  } else {
+    USBSerial.println("writeBmpToSd: I2C unavailable, skipping accel rotation");
+    rotationDeg = 0;
+  }
 
-  // Write pixel data bottom-up (BMP convention), byte-swap each pixel RGB565
-  // Progress goes from 25% to 93% during pixel write
-  const uint16_t *pixels = reinterpret_cast<const uint16_t *>(fb->buf);
-  // Allocate a row buffer on the stack (max width 1600 * 2 = 3200 bytes)
-  static uint8_t rowBuf[1600 * 2];
-  const uint8_t progressStart = 25;
-  const uint8_t progressEnd   = 93;
+  const uint16_t *srcPixels = reinterpret_cast<const uint16_t *>(fb->buf);
+  uint16_t *rotPixels = nullptr;
+  int outW = w, outH = h;
+  if (rotationDeg == 90 || rotationDeg == 270) {
+    outW = h;
+    outH = w;
+  }
 
-  for (int32_t row = h - 1; row >= 0; row--) {
-    const uint16_t *src = pixels + row * w;
-    for (int32_t col = 0; col < w; col++) {
-      uint16_t px = src[col];
-      rowBuf[col * 2]     = (uint8_t)(px & 0xFF);        // low byte first (little-endian)
+  // Allocate row buffer and optional rotated pixel buffer in PSRAM
+  uint8_t *rowBuf = (uint8_t *)heap_caps_malloc((size_t)outW * 2, MALLOC_CAP_SPIRAM);
+  if (!rowBuf) {
+    f.close();
+    return Status::Error(StatusCode::IOError, "failed to allocate row buffer");
+  }
+
+  if (rotationDeg != 0) {
+    rotPixels = (uint16_t *)heap_caps_malloc((size_t)outW * (size_t)outH * sizeof(uint16_t), MALLOC_CAP_SPIRAM);
+    if (!rotPixels) {
+      // fallback: write without rotation
+      USBSerial.println("writeBmpToSd: rotation alloc failed, writing without rotation");
+      rotationDeg = 0;
+    }
+  }
+
+  if (rotPixels) {
+    // Perform rotation into rotPixels
+    if (rotationDeg == 90) {
+      for (int32_t r = 0; r < h; ++r) {
+        for (int32_t c = 0; c < w; ++c) {
+          // dest[c * h + (h - 1 - r)] = src[r * w + c];
+          rotPixels[(size_t)c * (size_t)h + (size_t)(h - 1 - r)] = srcPixels[(size_t)r * (size_t)w + (size_t)c];
+        }
+      }
+    } else if (rotationDeg == 270) {
+      for (int32_t r = 0; r < h; ++r) {
+        for (int32_t c = 0; c < w; ++c) {
+          // dest[(w - 1 - c) * h + r] = src[r * w + c];
+          rotPixels[(size_t)(w - 1 - c) * (size_t)h + (size_t)r] = srcPixels[(size_t)r * (size_t)w + (size_t)c];
+        }
+      }
+    } else if (rotationDeg == 180) {
+      for (int32_t r = 0; r < h; ++r) {
+        for (int32_t c = 0; c < w; ++c) {
+          rotPixels[(size_t)(h - 1 - r) * (size_t)w + (size_t)(w - 1 - c)] = srcPixels[(size_t)r * (size_t)w + (size_t)c];
+        }
+      }
+    }
+  }
+
+  const uint16_t progressStart = 25;
+  const uint16_t progressEnd = 93;
+  uint8_t lastPct = 0;
+
+  // Write rows bottom-up using rotated buffer if present
+  for (int32_t row = outH - 1; row >= 0; row--) {
+    const uint16_t *srcRow;
+    if (rotPixels) {
+      srcRow = rotPixels + (size_t)row * (size_t)outW;
+    } else {
+      srcRow = srcPixels + (size_t)row * (size_t)w;
+    }
+
+    for (int32_t col = 0; col < outW; col++) {
+      uint16_t px = srcRow[col];
+      rowBuf[col * 2] = (uint8_t)(px & 0xFF);
       rowBuf[col * 2 + 1] = (uint8_t)(px >> 8);
     }
-    f.write(rowBuf, rowBytes);
+
+    size_t wrote = f.write(rowBuf, (size_t)outW * 2);
+    if (wrote != (size_t)outW * 2) {
+      f.close();
+      heap_caps_free(rowBuf);
+      if (rotPixels) heap_caps_free(rotPixels);
+      return Status::Error(StatusCode::IOError, "failed to write bmp row");
+    }
 
     if (onProgress) {
-      // Notify every 5% change to avoid flooding the display update
-      uint8_t pct = progressStart +
-                    (uint8_t)(((uint32_t)(h - 1 - row) * (progressEnd - progressStart)) /
-                               (uint32_t)(h - 1));
-      static uint8_t lastPct = 0;
+      uint8_t pct = progressStart + (uint8_t)(((uint32_t)(outH - 1 - row) * (progressEnd - progressStart)) / (uint32_t)(outH - 1));
       if (pct != lastPct) {
         onProgress(pct);
         lastPct = pct;
       }
     }
   }
+
+  heap_caps_free(rowBuf);
+  if (rotPixels) heap_caps_free(rotPixels);
 
   f.flush();
   f.close();
