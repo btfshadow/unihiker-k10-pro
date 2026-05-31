@@ -10,6 +10,8 @@
 #include <Wire.h>
 #include <asr.h>
 #include <esp_camera.h>
+#include <esp_system.h>
+#include <driver/i2c.h>
 #include <freertos/FreeRTOS.h>
 #include <freertos/semphr.h>
 #include <freertos/task.h>
@@ -96,10 +98,37 @@ static bool prefsBegin(Preferences &prefs, bool readOnly) {
 
 static bool initLiveCaptureQueue(framesize_t size) {
   if (!gLiveCaptureQueue) {
+    USBSerial.printf("initLiveCaptureQueue: creating queue for size=%d\n", (int)size);
     gLiveCaptureQueue = xQueueCreate(2, sizeof(camera_fb_t *));
     if (!gLiveCaptureQueue) return false;
   }
+  USBSerial.printf("initLiveCaptureQueue: ensuring I2C driver for SCCB (size=%d)\n", (int)size);
+  // Ensure I2C driver is installed for SCCB camera pins before probing the sensor.
+  {
+    i2c_config_t conf;
+    conf.mode = I2C_MODE_MASTER;
+    conf.sda_io_num = (gpio_num_t)47; // CAMERA_PIN_SIOD
+    conf.scl_io_num = (gpio_num_t)48; // CAMERA_PIN_SIOC
+    conf.sda_pullup_en = GPIO_PULLUP_ENABLE;
+    conf.scl_pullup_en = GPIO_PULLUP_ENABLE;
+    conf.master.clk_speed = 100000;
+    i2c_param_config(I2C_NUM_0, &conf);
+    esp_err_t r = i2c_driver_install(I2C_NUM_0, I2C_MODE_MASTER, 0, 0, 0);
+    if (r == ESP_OK) {
+      USBSerial.println("initLiveCaptureQueue: i2c driver installed");
+    } else if (r == ESP_ERR_INVALID_STATE) {
+      USBSerial.println("initLiveCaptureQueue: i2c driver already installed");
+    } else {
+      USBSerial.printf("initLiveCaptureQueue: i2c_driver_install failed=%d\n", (int)r);
+    }
+  }
+
+  USBSerial.printf("initLiveCaptureQueue: calling register_camera (size=%d)\n", (int)size);
   register_camera(PIXFORMAT_RGB565, size, 1, gLiveCaptureQueue);
+  // Ensure the board-level camera display uses the same queue to avoid
+  // double-registration and conflicting frame ownership.
+  xQueueCamer = gLiveCaptureQueue;
+  USBSerial.printf("initLiveCaptureQueue: register_camera done, queue=%p\n", (void*)gLiveCaptureQueue);
   return true;
 }
 
@@ -1727,8 +1756,8 @@ void CameraService::handleLiveAShort() {
     return;
   }
 
-  cycleDefaultLiveResolution();
-  drawDefaultLiveUi();
+  // Default mapping: A short = capture (user preference).
+  (void)queueDefaultLiveCaptureByReboot();
 }
 
 void CameraService::handleLiveALong() {
@@ -1752,12 +1781,21 @@ void CameraService::handleLiveBShort() {
     return;
   }
 
-  (void)queueDefaultLiveCaptureByReboot();
+  // Default mapping: B short = cycle resolution.
+  cycleDefaultLiveResolution();
+  drawDefaultLiveUi();
 }
 
 void CameraService::handleLiveBLong() {
   if (!liveControllerActive_) return;
+  // Default behavior for long-B: leave live context and stop camera (return to caller)
+  ButtonCallback onReturnContext = liveOptions_.onReturnContext;
   ButtonCallback onBLong = liveOptions_.onBLong;
+
+  // Stop camera (soft stop) and clear live options
+  (void)cameraStop(false);
+
+  if (onReturnContext) onReturnContext();
   if (onBLong) onBLong();
 }
 
@@ -1824,6 +1862,14 @@ Status CameraService::cameraLiveBoot(const CameraLiveOptions &options, bool *ent
   }
 
   if (role == (uint8_t)LiveRoleLive) {
+    esp_reset_reason_t rr = esp_reset_reason();
+    // Only auto-enter live mode on software restarts or deep-sleep wakeups.
+    // If the reset was external (manual reset / power-on), return to menu instead.
+    if (!(rr == ESP_RST_SW || rr == ESP_RST_DEEPSLEEP)) {
+      USBSerial.printf("cameraLiveBoot: skipping auto-live (reset reason=%d)\n", (int)rr);
+      return Status::OkStatus();
+    }
+
     Status st = cameraLive(options);
     if (st.ok() && enteredLive) *enteredLive = true;
     return st;
@@ -1876,6 +1922,17 @@ Status CameraService::captureDefaultLivePhoto() {
   if (st.ok()) {
     (void)saveLivePhoto();
     USBSerial.printf("cameraLive default: saved %s\n", path.c_str());
+    // Confirmation log and brief UI confirmation overlay
+    USBSerial.printf("cameraLive: capture confirmed -> %s\n", path.c_str());
+    if (hal_.isReady() && hal_.board().canvas != nullptr) {
+      hal_.board().canvas->canvasClear();
+      hal_.board().canvas->canvasText("FOTO SALVA", 1, 0x00FF99);
+      hal_.board().canvas->canvasText(shownPath,
+                                      8, 52, 0xFFFFFF,
+                                      Canvas::eCNAndENFont16, 28, true);
+      hal_.board().canvas->updateCanvas();
+      delay(700);
+    }
     if (hal_.isReady() && hal_.board().canvas != nullptr) {
       hal_.board().canvas->canvasClear();
       hal_.board().canvas->canvasText("foto salva", 1, 0x00FF99);
@@ -1914,14 +1971,11 @@ void CameraService::drawDefaultLiveUi() {
     return;
   }
   hal_.board().canvas->canvasClear();
-  hal_.board().canvas->canvasText("camera live", 1, 0xFFFFFF);
-  hal_.board().canvas->canvasText(String("res: ") + currentLiveResolutionName(),
-                                  8, 46, 0xCFE8FF,
-                                  Canvas::eCNAndENFont16, 28, true);
-  hal_.board().canvas->canvasText("A<2s:res  B<2s:foto", 8, 78, 0x66CCFF,
-                                  Canvas::eCNAndENFont16, 28, true);
-  hal_.board().canvas->canvasText("A>2s:sair+limpar", 8, 108, 0x66CCFF,
-                                  Canvas::eCNAndENFont16, 28, true);
+  hal_.board().canvas->canvasText("live + hires capture", 1, 0xFFFFFF);
+  hal_.board().canvas->canvasText(String("Live: QVGA background"), 10, 42, 0xBBBBBB, Canvas::eCNAndENFont16, 24, true);
+  hal_.board().canvas->canvasText(String("Capture: ") + currentLiveResolutionName(), 10, 72, 0xFFFFFF, Canvas::eCNAndENFont16, 26, true);
+  hal_.board().canvas->canvasText("A<2s:foto  B<2s:res", 10, 118, 0x66CCFF, Canvas::eCNAndENFont16, 22, true);
+  hal_.board().canvas->canvasText("B>2s:voltar", 10, 148, 0x66CCFF, Canvas::eCNAndENFont16, 22, true);
   hal_.board().canvas->updateCanvas();
 }
 
@@ -1984,6 +2038,13 @@ Status CameraService::initPreview() {
   if (!hal_.isReady()) {
     return Status::Error(StatusCode::NotInitialized, "board not initialized");
   }
+  // Ensure capture queue and camera driver configured for desired live resolution.
+  framesize_t previewSize = kLiveModes[liveResIndex_ % kLiveModeCount].size;
+  if (!initLiveCaptureQueue(previewSize)) {
+    USBSerial.printf("camera.initPreview: initLiveCaptureQueue failed for size %d\n", (int)previewSize);
+    // Fallthrough: try to enable background image anyway; camera may already be initialized.
+  }
+
   hal_.board().initBgCamerImage();
   hal_.board().setBgCamerImage(true);
   previewInitialized_ = true;
